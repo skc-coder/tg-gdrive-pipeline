@@ -32,8 +32,8 @@ echo ""
 
 rclone copy "$LOCAL_PATH" "$DESTINATION" \
     --progress \
-    --transfers 4 \
-    --checkers 8 \
+    --transfers 10 \
+    --checkers 15 \
     --drive-chunk-size 32M \
     --drive-upload-cutoff 8M \
     --drive-acknowledge-abuse \
