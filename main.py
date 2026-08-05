@@ -27,7 +27,7 @@ RCLONE_TRANSFERS = "5"
 # Max parallel file downloads (3 files at once)
 MAX_PARALLEL_DOWNLOADS = 3
 
-# Turbo Mode parallel DC sockets per file (8 sockets = 20-40 MB/s speed)
+# Turbo Mode parallel DC sockets per file
 SOCKETS_PER_FILE = 8
 
 # Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
@@ -73,7 +73,7 @@ def parse_subject_name(filename):
     cleaned = re.sub(r'(\.(zip|7z|rar|\d{3}))+$', '', filename, flags=re.IGNORECASE).strip()
     return cleaned if cleaned else filename
 
-def make_bar(percentage, length=12):
+def make_bar(percentage, length=10):
     filled = int(length * percentage / 100)
     bar = "█" * filled + "░" * (length - filled)
     return bar
@@ -114,18 +114,18 @@ class ParallelProgressManager:
         if self.rendered_lines > 0:
             sys.stdout.write(f"\x1b[{self.rendered_lines}A")
 
-        lines = ["\x1b[K Active Parallel Downloads (Turbo Multi-Socket Mode):"]
+        lines = ["\x1b[KActive Parallel Downloads (Turbo Multi-Socket Mode):"]
         for fname, st in list(self.stats.items()):
             curr_mb = st['current'] / (1024 * 1024)
             total_mb = st['total'] / (1024 * 1024) if st['total'] > 0 else 1.0
             pct = (st['current'] / st['total'] * 100) if st['total'] > 0 else 0.0
             speed = st.get('speed', 0.0)
             bar = make_bar(pct, length=10)
-            status_str = "DONE" if st.get('completed') else f"{speed:5.1f} MB/s"
+            status_str = "DONE" if st.get('completed') else f"{speed:4.1f} MB/s"
             
-            short_name = fname if len(fname) <= 20 else fname[:9] + "..." + fname[-8:]
-            line = f"\x1b[K  ├─ {short_name:<20} [{bar}] {pct:5.1f}% | {curr_mb:5.0f}/{total_mb:5.0f}MB | {status_str}"
-            lines.append(line[:80])
+            short_name = fname if len(fname) <= 18 else fname[:8] + "..." + fname[-7:]
+            line = f"\x1b[K  ├─ {short_name:<18} [{bar}] {pct:5.1f}% | {curr_mb:4.0f}/{total_mb:4.0f}MB | {status_str}"
+            lines.append(line[:75])
 
         out = "\n".join(lines) + "\n"
         sys.stdout.write(out)
@@ -144,32 +144,32 @@ async def download_part_task(client, msg, target_path, semaphore, manager):
         await fast_download_media(client, msg, target_path, progress_callback=cb, parallel_connections=SOCKETS_PER_FILE)
         manager.finish(fname)
 
-def extract_multipart_zip_stream(zip_folder, subject_name):
-    log(f"Stream-extracting volumes for '{subject_name}' into /tmp...")
+def extract_multipart_zip(zip_folder, subject_name):
+    """Extracts split multi-part zips (.001, .002...) cleanly with 7z using direct file seeking."""
+    target_extract_dir = os.path.join(EXTRACT_DIR, subject_name)
+    os.makedirs(target_extract_dir, exist_ok=True)
     
     parts = sorted([os.path.join(zip_folder, f) for f in os.listdir(zip_folder) if not f.endswith(".tmp")])
     if not parts:
         raise FileNotFoundError(f"No zip parts found in {zip_folder}")
 
-    target_extract_dir = os.path.join(EXTRACT_DIR, subject_name)
-    os.makedirs(target_extract_dir, exist_ok=True)
+    # Find the first volume (.001 or .zip)
+    first_part = parts[0]
+    for p in parts:
+        if p.endswith(".001") or p.endswith(".zip"):
+            first_part = p
+            break
 
-    log(f"Found {len(parts)} parts for extraction: {[os.path.basename(p) for p in parts]}")
+    log(f"Extracting multi-part archive starting from '{os.path.basename(first_part)}'...")
 
-    cat_cmd = ["cat"] + parts
-    sevenz_cmd = ["7z", "x", "-si", f"-o{target_extract_dir}", "-y"]
+    cmd = ["7z", "x", first_part, f"-o{target_extract_dir}", "-y"]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    p1 = subprocess.Popen(cat_cmd, stdout=subprocess.PIPE)
-    p2 = subprocess.Popen(sevenz_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    p1.stdout.close()
-
-    stdout, stderr = p2.communicate()
-
-    if p2.returncode != 0:
-        log(f"7z Extraction error:\n{stderr}")
+    if res.returncode != 0:
+        log(f"7z Extraction error:\n{res.stderr}")
         raise RuntimeError(f"Extraction failed for {subject_name}")
 
-    log(f"Successfully stream-extracted '{subject_name}'!")
+    log(f"Successfully extracted '{subject_name}' into '{target_extract_dir}'!")
 
 def upload_to_gdrive_parallel(local_folder, subject_name):
     remote_target = f"{RCLONE_REMOTE}/{subject_name}"
@@ -279,8 +279,8 @@ async def main():
             await render_task
             print("\nDownload complete for all parts!")
 
-            # 2. Extract multi-part zips using stream pipe into /tmp
-            extract_multipart_zip_stream(subj_zip_dir, subject)
+            # 2. Extract multi-part zips (.001, .002...) using direct file seeking
+            extract_multipart_zip(subj_zip_dir, subject)
 
             # 3. Delete raw zips immediately to free space in /tmp
             log(f"Cleaning raw zips for '{subject}'...")
