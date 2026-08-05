@@ -20,6 +20,9 @@ RCLONE_REMOTE = "gdrive:GATE_Courses"
 # Parallel upload threads for rclone
 RCLONE_TRANSFERS = "5"
 
+# Max parallel Telegram file downloads (3-4 parallel downloads)
+MAX_PARALLEL_DOWNLOADS = 3
+
 # Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
 TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
 ZIP_DIR = os.path.join(TEMP_STORAGE_DIR, "zips")
@@ -56,10 +59,13 @@ def parse_subject_name(filename):
         return match.group(1).strip()
     return os.path.splitext(filename)[0].strip()
 
-async def progress_callback(current, total):
-    percentage = (current / total) * 100
-    sys.stdout.write(f"\rDownloading part: {percentage:.2f}% ({current / (1024*1024):.1f}/{total / (1024*1024):.1f} MB)")
-    sys.stdout.flush()
+async def download_file_with_semaphore(msg, target_path, semaphore):
+    """Downloads a single Telegram file part using semaphore for concurrency control."""
+    fname = os.path.basename(target_path)
+    async with semaphore:
+        log(f"Starting download: {fname}")
+        await msg.download_media(file=target_path)
+        log(f"Finished download: {fname}")
 
 def extract_multipart_zip_stream(zip_folder, subject_name):
     log(f"Stream-extracting volumes for '{subject_name}' into /tmp...")
@@ -113,7 +119,7 @@ async def main():
 
     state = load_state()
     log("="*60)
-    log("GitHub Codespaces Pipeline Ready (/tmp 45GB partition)")
+    log(f"GitHub Codespaces Pipeline Ready (Parallel Downloads: {MAX_PARALLEL_DOWNLOADS})")
     log(f"Completed subjects so far: {state['completed_subjects']}")
     log("="*60)
 
@@ -147,6 +153,8 @@ async def main():
     for subj, msgs in subject_messages.items():
         log(f" - {subj}: {len(msgs)} parts")
 
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+
     for subject, msgs in subject_messages.items():
         if subject in state["completed_subjects"]:
             log(f"\n[SKIP] Subject '{subject}' already completed.")
@@ -169,13 +177,14 @@ async def main():
         os.makedirs(subj_zip_dir, exist_ok=True)
 
         try:
-            # 1. Download zip parts
-            log(f"Downloading {len(msgs)} parts for '{subject}' to /tmp...")
+            # 1. PARALLEL DOWNLOAD ZIP PARTS
+            log(f"Downloading {len(msgs)} parts in parallel (Concurrency limit: {MAX_PARALLEL_DOWNLOADS})...")
+            download_tasks = []
             for fname, msg in msgs:
                 target_path = os.path.join(subj_zip_dir, fname)
-                log(f"\nDownloading: {fname}")
-                await msg.download_media(file=target_path, progress_callback=progress_callback)
-            print()
+                download_tasks.append(download_file_with_semaphore(msg, target_path, semaphore))
+
+            await asyncio.gather(*download_tasks)
 
             # 2. Extract multi-part zips using stream pipe into /tmp
             extract_multipart_zip_stream(subj_zip_dir, subject)
