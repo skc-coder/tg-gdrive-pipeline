@@ -21,6 +21,9 @@ RCLONE_REMOTE = "gdrive:GATE_Courses"
 # Parallel upload threads for rclone
 RCLONE_TRANSFERS = "5"
 
+# Max parallel file downloads (3 files at once)
+MAX_PARALLEL_DOWNLOADS = 3
+
 # Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
 TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
 ZIP_DIR = os.path.join(TEMP_STORAGE_DIR, "zips")
@@ -52,37 +55,81 @@ def save_state(state):
         json.dump(state, f, indent=4)
 
 def parse_subject_name(filename):
-    """
-    Cleans filename to extract core subject name.
-    'Operating System.zip.001' -> 'Operating System'
-    'Operating System.zip.zip.001' -> 'Operating System'
-    'Data Structures.zip.004' -> 'Data Structures'
-    """
     cleaned = re.sub(r'(\.(zip|7z|rar|\d{3}))+$', '', filename, flags=re.IGNORECASE).strip()
     return cleaned if cleaned else filename
 
-class ProgressTracker:
-    def __init__(self, filename):
-        self.filename = filename
-        self.start_time = time.time()
-        self.last_print_time = 0
+def make_bar(percentage, length=20):
+    filled = int(length * percentage / 100)
+    bar = "█" * filled + "░" * (length - filled)
+    return bar
 
-    def callback(self, current, total):
+class ParallelProgressManager:
+    """Manages clean inline multi-line progress rendering without terminal bloat."""
+    def __init__ (self):
+        self.stats = {}
+        self.running = False
+        self.rendered_lines = 0
+
+    def update(self, fname, current, total):
         now = time.time()
-        # Print progress update at most twice per second to prevent terminal spam
-        if now - self.last_print_time >= 0.5 or current == total:
-            self.last_print_time = now
-            elapsed = max(now - self.start_time, 0.001)
-            speed_mbps = (current / (1024 * 1024)) / elapsed
-            percentage = (current / total) * 100 if total > 0 else 0
-            curr_mb = current / (1024 * 1024)
-            total_mb = total / (1024 * 1024)
+        if fname not in self.stats:
+            self.stats[fname] = {'start': now, 'current': current, 'total': total, 'speed': 0.0}
+        else:
+            st = self.stats[fname]
+            elapsed = max(now - st['start'], 0.001)
+            st['current'] = current
+            st['total'] = total
+            st['speed'] = (current / (1024 * 1024)) / elapsed
+
+    def finish(self, fname):
+        if fname in self.stats:
+            self.stats[fname]['completed'] = True
+
+    async def render_loop(self):
+        self.running = True
+        while self.running:
+            self.render()
+            await asyncio.sleep(0.4)
+        self.render()
+
+    def render(self):
+        if not self.stats:
+            return
+
+        # Move cursor back up to overwrite previous rendered lines
+        if self.rendered_lines > 0:
+            sys.stdout.write(f"\x1b[{self.rendered_lines}A")
+
+        lines = []
+        lines.append("\x1b[K Active Parallel Downloads:")
+        for fname, st in list(self.stats.items()):
+            curr_mb = st['current'] / (1024 * 1024)
+            total_mb = st['total'] / (1024 * 1024) if st['total'] > 0 else 1.0
+            pct = (st['current'] / st['total'] * 100) if st['total'] > 0 else 0.0
+            speed = st.get('speed', 0.0)
+            bar = make_bar(pct, length=15)
+            status_str = "DONE" if st.get('completed') else f"{speed:5.1f} MB/s"
             
-            sys.stdout.write(
-                f"\r Downloading {self.filename}: {percentage:5.1f}% | "
-                f"{curr_mb:6.1f} / {total_mb:6.1f} MB | {speed_mbps:5.2f} MB/s"
-            )
-            sys.stdout.flush()
+            # Truncate filename if too long for clean display
+            short_name = fname if len(fname) <= 30 else fname[:14] + "..." + fname[-13:]
+            lines.append(f"\x1b[K  ├─ {short_name:<30} [{bar}] {pct:5.1f}% | {curr_mb:6.1f}/{total_mb:6.1f} MB | {status_str}")
+
+        out = "\n".join(lines) + "\n"
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        self.rendered_lines = len(lines)
+
+    def stop(self):
+        self.running = False
+
+async def download_part_task(client, msg, target_path, semaphore, manager):
+    fname = os.path.basename(target_path)
+    async with semaphore:
+        def cb(current, total):
+            manager.update(fname, current, total)
+            
+        await client.download_media(file=target_path, progress_callback=cb)
+        manager.finish(fname)
 
 def extract_multipart_zip_stream(zip_folder, subject_name):
     log(f"Stream-extracting volumes for '{subject_name}' into /tmp...")
@@ -138,7 +185,7 @@ async def main():
 
     state = load_state()
     log("="*60)
-    log("GitHub Codespaces Pipeline Ready (High-Speed Sequential Downloader)")
+    log(f"GitHub Codespaces Pipeline (Parallel Downloads: {MAX_PARALLEL_DOWNLOADS})")
     log(f"Completed subjects so far: {state['completed_subjects']}")
     log("="*60)
 
@@ -172,6 +219,8 @@ async def main():
     for subj, msgs in subject_messages.items():
         log(f" - {subj}: {len(msgs)} parts")
 
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+
     for subject, msgs in subject_messages.items():
         if subject in state["completed_subjects"]:
             log(f"\n[SKIP] Subject '{subject}' already completed.")
@@ -194,14 +243,20 @@ async def main():
         os.makedirs(subj_zip_dir, exist_ok=True)
 
         try:
-            # 1. SEQUENTIAL DOWNLOAD WITH REAL-TIME SPEED & PROGRESS DISPLAY
-            log(f"Downloading {len(msgs)} parts sequentially for '{subject}'...")
-            for idx, (fname, msg) in enumerate(msgs, 1):
+            # 1. PARALLEL DOWNLOAD WITH CLEAN INLINE DASHBOARD
+            log(f"Downloading {len(msgs)} parts in parallel (Concurrency limit: {MAX_PARALLEL_DOWNLOADS})...")
+            manager = ParallelProgressManager()
+            render_task = asyncio.create_task(manager.render_loop())
+
+            download_tasks = []
+            for fname, msg in msgs:
                 target_path = os.path.join(subj_zip_dir, fname)
-                log(f"\n[Part {idx}/{len(msgs)}] {fname}")
-                tracker = ProgressTracker(fname)
-                await msg.download_media(file=target_path, progress_callback=tracker.callback)
-                print() # New line after completed download
+                download_tasks.append(download_part_task(client, msg, target_path, semaphore, manager))
+
+            await asyncio.gather(*download_tasks)
+            manager.stop()
+            await render_task
+            print("\nDownload complete for all parts!")
 
             # 2. Extract multi-part zips using stream pipe into /tmp
             extract_multipart_zip_stream(subj_zip_dir, subject)
