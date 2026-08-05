@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import json
 import re
 import subprocess
@@ -19,9 +20,6 @@ RCLONE_REMOTE = "gdrive:GATE_Courses"
 
 # Parallel upload threads for rclone
 RCLONE_TRANSFERS = "5"
-
-# Max parallel Telegram file downloads (3-4 parallel downloads)
-MAX_PARALLEL_DOWNLOADS = 3
 
 # Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
 TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
@@ -54,18 +52,37 @@ def save_state(state):
         json.dump(state, f, indent=4)
 
 def parse_subject_name(filename):
-    match = re.match(r"^(.*?)\.(zip|7z|rar)(\.\d+)?$", filename, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    return os.path.splitext(filename)[0].strip()
+    """
+    Cleans filename to extract core subject name.
+    'Operating System.zip.001' -> 'Operating System'
+    'Operating System.zip.zip.001' -> 'Operating System'
+    'Data Structures.zip.004' -> 'Data Structures'
+    """
+    cleaned = re.sub(r'(\.(zip|7z|rar|\d{3}))+$', '', filename, flags=re.IGNORECASE).strip()
+    return cleaned if cleaned else filename
 
-async def download_file_with_semaphore(msg, target_path, semaphore):
-    """Downloads a single Telegram file part using semaphore for concurrency control."""
-    fname = os.path.basename(target_path)
-    async with semaphore:
-        log(f"Starting download: {fname}")
-        await msg.download_media(file=target_path)
-        log(f"Finished download: {fname}")
+class ProgressTracker:
+    def __init__(self, filename):
+        self.filename = filename
+        self.start_time = time.time()
+        self.last_print_time = 0
+
+    def callback(self, current, total):
+        now = time.time()
+        # Print progress update at most twice per second to prevent terminal spam
+        if now - self.last_print_time >= 0.5 or current == total:
+            self.last_print_time = now
+            elapsed = max(now - self.start_time, 0.001)
+            speed_mbps = (current / (1024 * 1024)) / elapsed
+            percentage = (current / total) * 100 if total > 0 else 0
+            curr_mb = current / (1024 * 1024)
+            total_mb = total / (1024 * 1024)
+            
+            sys.stdout.write(
+                f"\r Downloading {self.filename}: {percentage:5.1f}% | "
+                f"{curr_mb:6.1f} / {total_mb:6.1f} MB | {speed_mbps:5.2f} MB/s"
+            )
+            sys.stdout.flush()
 
 def extract_multipart_zip_stream(zip_folder, subject_name):
     log(f"Stream-extracting volumes for '{subject_name}' into /tmp...")
@@ -76,6 +93,8 @@ def extract_multipart_zip_stream(zip_folder, subject_name):
 
     target_extract_dir = os.path.join(EXTRACT_DIR, subject_name)
     os.makedirs(target_extract_dir, exist_ok=True)
+
+    log(f"Found {len(parts)} parts for extraction: {[os.path.basename(p) for p in parts]}")
 
     cat_cmd = ["cat"] + parts
     sevenz_cmd = ["7z", "x", "-si", f"-o{target_extract_dir}", "-y"]
@@ -119,7 +138,7 @@ async def main():
 
     state = load_state()
     log("="*60)
-    log(f"GitHub Codespaces Pipeline Ready (Parallel Downloads: {MAX_PARALLEL_DOWNLOADS})")
+    log("GitHub Codespaces Pipeline Ready (High-Speed Sequential Downloader)")
     log(f"Completed subjects so far: {state['completed_subjects']}")
     log("="*60)
 
@@ -153,8 +172,6 @@ async def main():
     for subj, msgs in subject_messages.items():
         log(f" - {subj}: {len(msgs)} parts")
 
-    semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
-
     for subject, msgs in subject_messages.items():
         if subject in state["completed_subjects"]:
             log(f"\n[SKIP] Subject '{subject}' already completed.")
@@ -177,14 +194,14 @@ async def main():
         os.makedirs(subj_zip_dir, exist_ok=True)
 
         try:
-            # 1. PARALLEL DOWNLOAD ZIP PARTS
-            log(f"Downloading {len(msgs)} parts in parallel (Concurrency limit: {MAX_PARALLEL_DOWNLOADS})...")
-            download_tasks = []
-            for fname, msg in msgs:
+            # 1. SEQUENTIAL DOWNLOAD WITH REAL-TIME SPEED & PROGRESS DISPLAY
+            log(f"Downloading {len(msgs)} parts sequentially for '{subject}'...")
+            for idx, (fname, msg) in enumerate(msgs, 1):
                 target_path = os.path.join(subj_zip_dir, fname)
-                download_tasks.append(download_file_with_semaphore(msg, target_path, semaphore))
-
-            await asyncio.gather(*download_tasks)
+                log(f"\n[Part {idx}/{len(msgs)}] {fname}")
+                tracker = ProgressTracker(fname)
+                await msg.download_media(file=target_path, progress_callback=tracker.callback)
+                print() # New line after completed download
 
             # 2. Extract multi-part zips using stream pipe into /tmp
             extract_multipart_zip_stream(subj_zip_dir, subject)
