@@ -27,9 +27,6 @@ RCLONE_TRANSFERS = "5"
 # Max parallel file downloads (3 files at once)
 MAX_PARALLEL_DOWNLOADS = 3
 
-# Turbo Mode parallel DC sockets per file
-SOCKETS_PER_FILE = 8
-
 # Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
 TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
 ZIP_DIR = os.path.join(TEMP_STORAGE_DIR, "zips")
@@ -114,7 +111,7 @@ class ParallelProgressManager:
         if self.rendered_lines > 0:
             sys.stdout.write(f"\x1b[{self.rendered_lines}A")
 
-        lines = ["\x1b[KActive Parallel Downloads (Turbo Multi-Socket Mode):"]
+        lines = ["\x1b[KActive Parallel Downloads:"]
         for fname, st in list(self.stats.items()):
             curr_mb = st['current'] / (1024 * 1024)
             total_mb = st['total'] / (1024 * 1024) if st['total'] > 0 else 1.0
@@ -141,7 +138,7 @@ async def download_part_task(client, msg, target_path, semaphore, manager):
         def cb(current, total):
             manager.update(fname, current, total)
             
-        await fast_download_media(client, msg, target_path, progress_callback=cb, parallel_connections=SOCKETS_PER_FILE)
+        await fast_download_media(client, msg, target_path, progress_callback=cb)
         manager.finish(fname)
 
 def extract_multipart_zip(zip_folder, subject_name):
@@ -198,7 +195,7 @@ async def main():
 
     state = load_state()
     log("="*60)
-    log(f"GitHub Codespaces Pipeline (Turbo Downloads: {MAX_PARALLEL_DOWNLOADS} files x {SOCKETS_PER_FILE} Sockets)")
+    log(f"GitHub Codespaces Pipeline (Parallel Downloads: {MAX_PARALLEL_DOWNLOADS} files)")
     log(f"Completed subjects so far: {state['completed_subjects']}")
     log("="*60)
 
@@ -256,6 +253,15 @@ async def main():
         subj_zip_dir = os.path.join(ZIP_DIR, subject)
         subj_extract_dir = os.path.join(EXTRACT_DIR, subject)
 
+        # Merge legacy folder names (e.g. Operating System.zip -> Operating System)
+        legacy_zip_dir = subj_zip_dir + ".zip"
+        if os.path.exists(legacy_zip_dir):
+            os.makedirs(subj_zip_dir, exist_ok=True)
+            for f in os.listdir(legacy_zip_dir):
+                shutil.move(os.path.join(legacy_zip_dir, f), os.path.join(subj_zip_dir, f))
+            shutil.rmtree(legacy_zip_dir)
+            log(f"Merged legacy folder '{legacy_zip_dir}' into '{subj_zip_dir}'")
+
         os.makedirs(subj_zip_dir, exist_ok=True)
 
         # Check if all zip parts are already downloaded locally in /tmp
@@ -270,7 +276,7 @@ async def main():
             if all_downloaded:
                 log(f"[SKIP DOWNLOAD] All {len(msgs)} zip parts for '{subject}' already exist in /tmp! Proceeding straight to extraction...")
             else:
-                log(f"Downloading {len(msgs)} parts in parallel (Turbo Mode)...")
+                log(f"Downloading {len(msgs)} parts in parallel...")
                 manager = ParallelProgressManager()
                 render_task = asyncio.create_task(manager.render_loop())
 
