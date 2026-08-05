@@ -27,6 +27,22 @@ RCLONE_TRANSFERS = "5"
 # Max parallel file downloads (3 files at once)
 MAX_PARALLEL_DOWNLOADS = 3
 
+# Subject processing order specified by user
+PRIORITY_ORDER = [
+    "Compiler Design",
+    "Data Structures",
+    "C Programming",
+    "Digital Logic",
+    "Algorithms",
+    "Operating System"
+]
+
+# Explicitly excluded subjects
+EXCLUDED_SUBJECTS = [
+    "Computer Organization & Architecture",
+    "COA"
+]
+
 # Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
 TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
 ZIP_DIR = os.path.join(TEMP_STORAGE_DIR, "zips")
@@ -69,6 +85,12 @@ def save_state(state):
 def parse_subject_name(filename):
     cleaned = re.sub(r'(\.(zip|7z|rar|\d{3}))+$', '', filename, flags=re.IGNORECASE).strip()
     return cleaned if cleaned else filename
+
+def get_subject_priority(subject):
+    for idx, p in enumerate(PRIORITY_ORDER):
+        if p.lower() in subject.lower():
+            return idx
+    return 999
 
 def find_existing_file(subj_zip_dir, fname):
     """Detects existing files on disk even if extra .zip extensions were appended."""
@@ -217,7 +239,7 @@ async def main():
 
     state = load_state()
     log("="*60)
-    log(f"GitHub Codespaces Pipeline (Parallel Downloads: {MAX_PARALLEL_DOWNLOADS} files)")
+    log(f"GitHub Codespaces Pipeline (Priority Processing)")
     log(f"Completed subjects so far: {state['completed_subjects']}")
     log("="*60)
 
@@ -253,15 +275,25 @@ async def main():
             if message.file and message.file.name:
                 fname = message.file.name
                 subject = parse_subject_name(fname)
+                
+                # Check if subject is explicitly excluded
+                if any(ex.lower() in subject.lower() for ex in EXCLUDED_SUBJECTS):
+                    continue
+                    
                 subject_messages[subject].append((fname, message))
 
-    log(f"Discovered {len(subject_messages)} distinct subjects:")
-    for subj, msgs in subject_messages.items():
-        log(f" - {subj}: {len(msgs)} parts")
+    # Sort subjects by custom priority list
+    sorted_subjects = sorted(subject_messages.keys(), key=get_subject_priority)
+
+    log(f"Discovered {len(sorted_subjects)} distinct subjects (Sorted by Priority):")
+    for idx, subj in enumerate(sorted_subjects, 1):
+        log(f" {idx}. {subj}: {len(subject_messages[subj])} parts")
 
     semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
 
-    for subject, msgs in subject_messages.items():
+    for subject in sorted_subjects:
+        msgs = subject_messages[subject]
+        
         if subject in state["completed_subjects"]:
             log(f"\n[SKIP] Subject '{subject}' already completed.")
             continue
@@ -338,7 +370,7 @@ async def main():
             state["failed_subjects"].append(subject)
             save_state(state)
 
-    log("\nAll subjects successfully processed!")
+    log("\nAll priority subjects successfully processed!")
     await client.disconnect()
 
 if __name__ == '__main__':
