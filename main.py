@@ -153,7 +153,6 @@ def extract_multipart_zip(zip_folder, subject_name):
     if not parts:
         raise FileNotFoundError(f"No zip parts found in {zip_folder}")
 
-    # Find the first volume (.001 or .zip)
     first_part = parts[0]
     for p in parts:
         if p.endswith(".001") or p.endswith(".zip"):
@@ -257,27 +256,33 @@ async def main():
         subj_zip_dir = os.path.join(ZIP_DIR, subject)
         subj_extract_dir = os.path.join(EXTRACT_DIR, subject)
 
-        if os.path.exists(subj_zip_dir):
-            shutil.rmtree(subj_zip_dir)
-        if os.path.exists(subj_extract_dir):
-            shutil.rmtree(subj_extract_dir)
-
         os.makedirs(subj_zip_dir, exist_ok=True)
 
+        # Check if all zip parts are already downloaded locally in /tmp
+        all_downloaded = False
+        if os.path.exists(subj_zip_dir):
+            existing_files = set(os.listdir(subj_zip_dir))
+            expected_files = set([fname for fname, msg in msgs])
+            if expected_files and expected_files.issubset(existing_files):
+                all_downloaded = True
+
         try:
-            log(f"Downloading {len(msgs)} parts in parallel (Turbo Mode)...")
-            manager = ParallelProgressManager()
-            render_task = asyncio.create_task(manager.render_loop())
+            if all_downloaded:
+                log(f"[SKIP DOWNLOAD] All {len(msgs)} zip parts for '{subject}' already exist in /tmp! Proceeding straight to extraction...")
+            else:
+                log(f"Downloading {len(msgs)} parts in parallel (Turbo Mode)...")
+                manager = ParallelProgressManager()
+                render_task = asyncio.create_task(manager.render_loop())
 
-            download_tasks = []
-            for fname, msg in msgs:
-                target_path = os.path.join(subj_zip_dir, fname)
-                download_tasks.append(download_part_task(client, msg, target_path, semaphore, manager))
+                download_tasks = []
+                for fname, msg in msgs:
+                    target_path = os.path.join(subj_zip_dir, fname)
+                    download_tasks.append(download_part_task(client, msg, target_path, semaphore, manager))
 
-            await asyncio.gather(*download_tasks)
-            manager.stop()
-            await render_task
-            print("\nDownload complete for all parts!")
+                await asyncio.gather(*download_tasks)
+                manager.stop()
+                await render_task
+                print("\nDownload complete for all parts!")
 
             # 2. Extract multi-part zips (.001, .002...) using direct file seeking
             extract_multipart_zip(subj_zip_dir, subject)
@@ -302,10 +307,6 @@ async def main():
             log(f"[ERROR] Subject '{subject}' failed: {e}")
             state["failed_subjects"].append(subject)
             save_state(state)
-            if os.path.exists(subj_zip_dir):
-                shutil.rmtree(subj_zip_dir)
-            if os.path.exists(subj_extract_dir):
-                shutil.rmtree(subj_extract_dir)
 
     log("\nAll subjects successfully processed!")
     await client.disconnect()
