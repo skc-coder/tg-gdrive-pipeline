@@ -101,7 +101,6 @@ def find_existing_file(subj_zip_dir, fname):
     if os.path.exists(direct) and os.path.getsize(direct) > 0:
         return direct
 
-    # Match part extension (e.g. .001, .002...)
     match = re.search(r'(\.\d{3})$', fname)
     part_ext = match.group(1) if match else None
 
@@ -185,8 +184,39 @@ async def download_part_task(client, msg, target_path, semaphore, manager):
         await fast_download_media(client, msg, target_path, progress_callback=cb)
         manager.finish(fname)
 
+def extract_nested_archives(folder_path):
+    """
+    Recursively checks for nested .zip, .7z, or .rar files inside folder_path,
+    extracts them further, and deletes the archive files.
+    """
+    archive_found = True
+    while archive_found:
+        archive_found = False
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in ['.zip', '.7z', '.rar']:
+                    archive_path = os.path.join(root, file)
+                    log(f"Found nested archive '{file}' inside '{root}'. Extracting further...")
+                    
+                    cmd = ["7z", "x", archive_path, f"-o{root}", "-y"]
+                    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if res.returncode == 0:
+                        log(f"Successfully extracted nested archive '{file}'!")
+                        try:
+                            os.remove(archive_path)
+                            log(f"Deleted nested archive file '{file}' to free space.")
+                        except Exception as e:
+                            log(f"Warning: Could not remove nested archive '{file}': {e}")
+                        archive_found = True
+                        break
+                    else:
+                        log(f"Warning: Failed to extract nested archive '{file}': {res.stderr}")
+            if archive_found:
+                break
+
 def extract_multipart_zip(zip_folder, subject_name):
-    """Extracts split multi-part zips (.001, .002...) cleanly with 7z using direct file seeking."""
+    """Extracts split multi-part zips (.001, .002...) cleanly with 7z and handles nested zips."""
     target_extract_dir = os.path.join(EXTRACT_DIR, subject_name)
     os.makedirs(target_extract_dir, exist_ok=True)
     
@@ -209,7 +239,10 @@ def extract_multipart_zip(zip_folder, subject_name):
         log(f"7z Extraction error:\n{res.stderr}")
         raise RuntimeError(f"Extraction failed for {subject_name}")
 
-    log(f"Successfully extracted '{subject_name}' into '{target_extract_dir}'!")
+    log(f"Successfully extracted split volumes for '{subject_name}'!")
+    
+    # Extract any nested zips found inside the extracted folder
+    extract_nested_archives(target_extract_dir)
 
 def upload_to_gdrive_parallel(local_folder, subject_name):
     remote_target = f"{RCLONE_REMOTE}/{subject_name}"
@@ -231,6 +264,41 @@ def upload_to_gdrive_parallel(local_folder, subject_name):
         raise RuntimeError(f"Rclone upload failed for {subject_name}")
     log(f"Upload completed for {subject_name}!")
 
+def process_pending_extractions(state):
+    """Checks /tmp/tg_pipeline/extracted/ for unuploaded folders, extracts nested zips, and uploads them."""
+    if not os.path.exists(EXTRACT_DIR):
+        return
+
+    extracted_folders = [d for d in os.listdir(EXTRACT_DIR) if os.path.isdir(os.path.join(EXTRACT_DIR, d))]
+    if not extracted_folders:
+        return
+
+    log(f"Found {len(extracted_folders)} pending extracted folder(s) in /tmp: {extracted_folders}")
+    for subject in extracted_folders:
+        if subject in state["completed_subjects"]:
+            log(f"Skipping already completed subject '{subject}'.")
+            continue
+
+        log(f"\nProcessing pending extracted folder: {subject}")
+        subj_extract_dir = os.path.join(EXTRACT_DIR, subject)
+
+        try:
+            # 1. Extract any inner nested zips
+            extract_nested_archives(subj_extract_dir)
+
+            # 2. Upload to Google Drive
+            upload_to_gdrive_parallel(subj_extract_dir, subject)
+
+            # 3. Clean up folder
+            shutil.rmtree(subj_extract_dir)
+
+            # 4. Save state
+            state["completed_subjects"].append(subject)
+            save_state(state)
+            log(f"[SUCCESS] Pending subject '{subject}' extracted further, uploaded, and cleaned!")
+        except Exception as e:
+            log(f"[ERROR] Processing pending folder '{subject}' failed: {e}")
+
 async def main():
     cleanup_stale_session_locks()
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
@@ -239,9 +307,12 @@ async def main():
 
     state = load_state()
     log("="*60)
-    log(f"GitHub Codespaces Pipeline (Priority Processing)")
+    log(f"GitHub Codespaces Pipeline (Priority Processing & Nested Zip Extraction)")
     log(f"Completed subjects so far: {state['completed_subjects']}")
     log("="*60)
+
+    # First, process any pending extracted folders sitting in /tmp
+    process_pending_extractions(state)
 
     client = TelegramClient('telegram_session', API_ID, API_HASH)
 
@@ -276,13 +347,11 @@ async def main():
                 fname = message.file.name
                 subject = parse_subject_name(fname)
                 
-                # Check if subject is explicitly excluded
                 if any(ex.lower() in subject.lower() for ex in EXCLUDED_SUBJECTS):
                     continue
                     
                 subject_messages[subject].append((fname, message))
 
-    # Sort subjects by custom priority list
     sorted_subjects = sorted(subject_messages.keys(), key=get_subject_priority)
 
     log(f"Discovered {len(sorted_subjects)} distinct subjects (Sorted by Priority):")
@@ -307,7 +376,6 @@ async def main():
         subj_zip_dir = os.path.join(ZIP_DIR, subject)
         subj_extract_dir = os.path.join(EXTRACT_DIR, subject)
 
-        # Merge legacy folder names (e.g. Operating System.zip -> Operating System)
         legacy_zip_dir = subj_zip_dir + ".zip"
         if os.path.exists(legacy_zip_dir):
             os.makedirs(subj_zip_dir, exist_ok=True)
@@ -318,7 +386,6 @@ async def main():
 
         os.makedirs(subj_zip_dir, exist_ok=True)
 
-        # Smart detection of downloaded parts (matching extension .001, .002...)
         files_to_download = []
         for fname, msg in msgs:
             existing = find_existing_file(subj_zip_dir, fname)
@@ -346,7 +413,7 @@ async def main():
                 await render_task
                 print("\nDownload complete for all remaining parts!")
 
-            # 2. Extract multi-part zips (.001, .002...) using direct file seeking
+            # 2. Extract multi-part zips (.001, .002...) and any inner nested zips
             extract_multipart_zip(subj_zip_dir, subject)
 
             # 3. Delete raw zips immediately to free space in /tmp
