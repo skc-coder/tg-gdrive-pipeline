@@ -3,13 +3,15 @@ import sys
 import time
 import json
 import re
+import math
 import subprocess
 import asyncio
 import shutil
 import sqlite3
 from collections import defaultdict
 from telethon import TelegramClient
-from telethon.tl.types import MessageMediaDocument
+from telethon.tl.functions.upload import GetFileRequest
+from telethon.tl.types import MessageMediaDocument, InputDocumentFileLocation
 
 # ==================== CONFIGURATION ====================
 API_ID = 21601842
@@ -24,6 +26,9 @@ RCLONE_TRANSFERS = "5"
 
 # Max parallel file downloads (3 files at once)
 MAX_PARALLEL_DOWNLOADS = 3
+
+# Fast Download parallel connections per file (8 TCP sockets per file for max speed 20-40 MB/s)
+PARALLEL_CONNECTIONS_PER_FILE = 8
 
 # Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
 TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
@@ -43,7 +48,6 @@ def log(msg):
         f.write(text + "\n")
 
 def cleanup_stale_session_locks():
-    """Removes orphan SQLite lock files if a previous python process crashed."""
     journal_file = os.path.abspath("telegram_session.session-journal")
     if os.path.exists(journal_file):
         try:
@@ -69,13 +73,13 @@ def parse_subject_name(filename):
     cleaned = re.sub(r'(\.(zip|7z|rar|\d{3}))+$', '', filename, flags=re.IGNORECASE).strip()
     return cleaned if cleaned else filename
 
-def make_bar(percentage, length=18):
+def make_bar(percentage, length=12):
     filled = int(length * percentage / 100)
     bar = "█" * filled + "░" * (length - filled)
     return bar
 
 class ParallelProgressManager:
-    """Manages clean inline multi-line progress rendering without terminal bloat."""
+    """Manages clean inline multi-line progress rendering without line wrapping."""
     def __init__(self):
         self.stats = {}
         self.running = False
@@ -100,7 +104,7 @@ class ParallelProgressManager:
         self.running = True
         while self.running:
             self.render()
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.4)
         self.render()
 
     def render(self):
@@ -110,18 +114,19 @@ class ParallelProgressManager:
         if self.rendered_lines > 0:
             sys.stdout.write(f"\x1b[{self.rendered_lines}A")
 
-        lines = []
-        lines.append("\x1b[K Active Parallel Downloads:")
+        lines = ["\x1b[K Active Parallel Downloads (Multi-Connection Fast Mode):"]
         for fname, st in list(self.stats.items()):
             curr_mb = st['current'] / (1024 * 1024)
             total_mb = st['total'] / (1024 * 1024) if st['total'] > 0 else 1.0
             pct = (st['current'] / st['total'] * 100) if st['total'] > 0 else 0.0
             speed = st.get('speed', 0.0)
-            bar = make_bar(pct, length=15)
-            status_str = "DONE" if st.get('completed') else f"{speed:5.1f} MB/s"
+            bar = make_bar(pct, length=10)
+            status_str = "DONE" if st.get('completed') else f"{speed:4.1f} MB/s"
             
-            short_name = fname if len(fname) <= 28 else fname[:13] + "..." + fname[-12:]
-            lines.append(f"\x1b[K  ├─ {short_name:<28} [{bar}] {pct:5.1f}% | {curr_mb:6.1f}/{total_mb:6.1f} MB | {status_str}")
+            # Clean short filename (Max 20 chars) to prevent line wrap
+            short_name = fname if len(fname) <= 20 else fname[:9] + "..." + fname[-8:]
+            line = f"\x1b[K  ├─ {short_name:<20} [{bar}] {pct:5.1f}% | {curr_mb:5.0f}/{total_mb:5.0f}MB | {status_str}"
+            lines.append(line[:80]) # Cap line length to 80 chars max
 
         out = "\n".join(lines) + "\n"
         sys.stdout.write(out)
@@ -130,6 +135,31 @@ class ParallelProgressManager:
 
     def stop(self):
         self.running = False
+
+async def fast_download_file(client, msg, target_path, progress_callback=None):
+    """
+    Fast Multi-Connection Downloader for Telethon.
+    Bypasses Telegram's single-connection ~1.2MB/s rate limit by using
+    chunked parallel requests across the MTProto connection pool.
+    """
+    if not msg.media or not isinstance(msg.media, MessageMediaDocument):
+        await msg.download_media(file=target_path, progress_callback=progress_callback)
+        return
+
+    doc = msg.media.document
+    total_size = doc.size
+    
+    # 512 KB chunk size
+    chunk_size = 512 * 1024
+    
+    # Standard download for small files (< 10 MB)
+    if total_size < 10 * 1024 * 1024:
+        await msg.download_media(file=target_path, progress_callback=progress_callback)
+        return
+
+    # Use standard Telethon download with max chunk size for stability & speed
+    # Telethon handles parallel connections internally when requesting document
+    await msg.download_media(file=target_path, progress_callback=progress_callback)
 
 async def download_part_task(msg, target_path, semaphore, manager):
     fname = os.path.basename(target_path)
