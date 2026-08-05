@@ -131,13 +131,13 @@ class ParallelProgressManager:
     def stop(self):
         self.running = False
 
-async def download_part_task(client, msg, target_path, semaphore, manager):
+async def download_part_task(msg, target_path, semaphore, manager):
     fname = os.path.basename(target_path)
     async with semaphore:
         def cb(current, total):
             manager.update(fname, current, total)
             
-        await client.download_media(file=target_path, progress_callback=cb)
+        await msg.download_media(file=target_path, progress_callback=cb)
         manager.finish(fname)
 
 def extract_multipart_zip_stream(zip_folder, subject_name):
@@ -268,7 +268,7 @@ async def main():
             download_tasks = []
             for fname, msg in msgs:
                 target_path = os.path.join(subj_zip_dir, fname)
-                download_tasks.append(download_part_task(client, msg, target_path, semaphore, manager))
+                download_tasks.append(download_part_task(msg, target_path, semaphore, manager))
 
             await asyncio.gather(*download_tasks)
             manager.stop()
