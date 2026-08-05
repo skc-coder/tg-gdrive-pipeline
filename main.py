@@ -264,31 +264,33 @@ async def main():
 
         os.makedirs(subj_zip_dir, exist_ok=True)
 
-        # Check if all zip parts are already downloaded locally in /tmp
-        all_downloaded = False
-        if os.path.exists(subj_zip_dir):
-            existing_files = set(os.listdir(subj_zip_dir))
-            expected_files = set([fname for fname, msg in msgs])
-            if expected_files and expected_files.issubset(existing_files):
-                all_downloaded = True
+        # Filter out files that are already 100% downloaded on disk
+        files_to_download = []
+        for fname, msg in msgs:
+            target_path = os.path.join(subj_zip_dir, fname)
+            expected_size = msg.file.size if (msg.file and hasattr(msg.file, 'size')) else 0
+            
+            if os.path.exists(target_path) and os.path.getsize(target_path) > 0 and (expected_size == 0 or os.path.getsize(target_path) == expected_size):
+                log(f" [SKIP FILE] '{fname}' ({os.path.getsize(target_path) / (1024*1024):.1f} MB) already exists on disk.")
+            else:
+                files_to_download.append((fname, msg, target_path))
 
         try:
-            if all_downloaded:
-                log(f"[SKIP DOWNLOAD] All {len(msgs)} zip parts for '{subject}' already exist in /tmp! Proceeding straight to extraction...")
+            if not files_to_download:
+                log(f"[ALL FILES PRESENT] All {len(msgs)} zip parts for '{subject}' already exist in /tmp! Proceeding straight to extraction...")
             else:
-                log(f"Downloading {len(msgs)} parts in parallel...")
+                log(f"Downloading {len(files_to_download)} remaining parts in parallel...")
                 manager = ParallelProgressManager()
                 render_task = asyncio.create_task(manager.render_loop())
 
                 download_tasks = []
-                for fname, msg in msgs:
-                    target_path = os.path.join(subj_zip_dir, fname)
+                for fname, msg, target_path in files_to_download:
                     download_tasks.append(download_part_task(client, msg, target_path, semaphore, manager))
 
                 await asyncio.gather(*download_tasks)
                 manager.stop()
                 await render_task
-                print("\nDownload complete for all parts!")
+                print("\nDownload complete for all remaining parts!")
 
             # 2. Extract multi-part zips (.001, .002...) using direct file seeking
             extract_multipart_zip(subj_zip_dir, subject)
