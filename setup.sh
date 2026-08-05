@@ -6,15 +6,15 @@ echo "   Telegram to GDrive Pipeline Quick Setup"
 echo "=================================================="
 
 # 1. Update & install system dependencies
-echo "[1/4] Installing system packages (p7zip-full, rclone, python3-pip)..."
+echo "[1/4] Installing system packages (p7zip-full, rclone, python3-pip, build-essential)..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq p7zip-full rclone python3-pip python3-venv
+sudo apt-get install -y -qq p7zip-full rclone python3-pip python3-venv build-essential libffi-dev
 
-# 2. Setup Python virtual environment
-echo "[2/4] Setting up Python virtual environment..."
+# 2. Setup Python virtual environment & install cryptg for 5x Telethon speed
+echo "[2/4] Setting up Python virtual environment with Turbo acceleration..."
 python3 -m venv venv
 ./venv/bin/pip install --upgrade pip -q
-./venv/bin/pip install telethon pillow -q
+./venv/bin/pip install telethon pillow cryptg -q
 
 # 3. Check Rclone configuration
 echo "[3/4] Checking Rclone configuration..."
