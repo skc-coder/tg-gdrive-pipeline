@@ -11,8 +11,6 @@ from collections import defaultdict
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument
 
-from fast_download import fast_download_media
-
 # ==================== CONFIGURATION ====================
 API_ID = 21601842
 API_HASH = "b824abd0e19c6c67b0b38ec8d470ba03"
@@ -26,9 +24,6 @@ RCLONE_TRANSFERS = "5"
 
 # Max parallel file downloads (3 files at once)
 MAX_PARALLEL_DOWNLOADS = 3
-
-# Fast Download parallel sockets per file (8 sockets per file = max network speed!)
-SOCKETS_PER_FILE = 8
 
 # Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
 TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
@@ -114,7 +109,7 @@ class ParallelProgressManager:
         if self.rendered_lines > 0:
             sys.stdout.write(f"\x1b[{self.rendered_lines}A")
 
-        lines = ["\x1b[K Active Parallel Downloads (Multi-Socket Turbo Mode):"]
+        lines = ["\x1b[K Active Parallel Downloads:"]
         for fname, st in list(self.stats.items()):
             curr_mb = st['current'] / (1024 * 1024)
             total_mb = st['total'] / (1024 * 1024) if st['total'] > 0 else 1.0
@@ -135,13 +130,13 @@ class ParallelProgressManager:
     def stop(self):
         self.running = False
 
-async def download_part_task(client, msg, target_path, semaphore, manager):
+async def download_part_task(msg, target_path, semaphore, manager):
     fname = os.path.basename(target_path)
     async with semaphore:
         def cb(current, total):
             manager.update(fname, current, total)
             
-        await fast_download_media(client, msg, target_path, progress_callback=cb, parallel_connections=SOCKETS_PER_FILE)
+        await msg.download_media(file=target_path, progress_callback=cb)
         manager.finish(fname)
 
 def extract_multipart_zip_stream(zip_folder, subject_name):
@@ -199,7 +194,7 @@ async def main():
 
     state = load_state()
     log("="*60)
-    log(f"GitHub Codespaces Pipeline (Turbo Downloads: {MAX_PARALLEL_DOWNLOADS} x {SOCKETS_PER_FILE} Sockets)")
+    log(f"GitHub Codespaces Pipeline (Parallel Downloads: {MAX_PARALLEL_DOWNLOADS})")
     log(f"Completed subjects so far: {state['completed_subjects']}")
     log("="*60)
 
@@ -265,14 +260,14 @@ async def main():
         os.makedirs(subj_zip_dir, exist_ok=True)
 
         try:
-            log(f"Downloading {len(msgs)} parts in parallel (Turbo Mode)...")
+            log(f"Downloading {len(msgs)} parts in parallel (Concurrency limit: {MAX_PARALLEL_DOWNLOADS})...")
             manager = ParallelProgressManager()
             render_task = asyncio.create_task(manager.render_loop())
 
             download_tasks = []
             for fname, msg in msgs:
                 target_path = os.path.join(subj_zip_dir, fname)
-                download_tasks.append(download_part_task(client, msg, target_path, semaphore, manager))
+                download_tasks.append(download_part_task(msg, target_path, semaphore, manager))
 
             await asyncio.gather(*download_tasks)
             manager.stop()
