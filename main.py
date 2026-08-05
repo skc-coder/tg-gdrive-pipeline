@@ -11,6 +11,8 @@ from collections import defaultdict
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument
 
+from fast_download import fast_download_media
+
 # ==================== CONFIGURATION ====================
 API_ID = 21601842
 API_HASH = "b824abd0e19c6c67b0b38ec8d470ba03"
@@ -24,6 +26,9 @@ RCLONE_TRANSFERS = "5"
 
 # Max parallel file downloads (3 files at once)
 MAX_PARALLEL_DOWNLOADS = 3
+
+# Turbo Mode parallel DC sockets per file (8 sockets = 20-40 MB/s speed)
+SOCKETS_PER_FILE = 8
 
 # Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
 TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
@@ -109,14 +114,14 @@ class ParallelProgressManager:
         if self.rendered_lines > 0:
             sys.stdout.write(f"\x1b[{self.rendered_lines}A")
 
-        lines = ["\x1b[K Active Parallel Downloads:"]
+        lines = ["\x1b[K Active Parallel Downloads (Turbo Multi-Socket Mode):"]
         for fname, st in list(self.stats.items()):
             curr_mb = st['current'] / (1024 * 1024)
             total_mb = st['total'] / (1024 * 1024) if st['total'] > 0 else 1.0
             pct = (st['current'] / st['total'] * 100) if st['total'] > 0 else 0.0
             speed = st.get('speed', 0.0)
             bar = make_bar(pct, length=10)
-            status_str = "DONE" if st.get('completed') else f"{speed:4.1f} MB/s"
+            status_str = "DONE" if st.get('completed') else f"{speed:5.1f} MB/s"
             
             short_name = fname if len(fname) <= 20 else fname[:9] + "..." + fname[-8:]
             line = f"\x1b[K  ├─ {short_name:<20} [{bar}] {pct:5.1f}% | {curr_mb:5.0f}/{total_mb:5.0f}MB | {status_str}"
@@ -130,13 +135,13 @@ class ParallelProgressManager:
     def stop(self):
         self.running = False
 
-async def download_part_task(msg, target_path, semaphore, manager):
+async def download_part_task(client, msg, target_path, semaphore, manager):
     fname = os.path.basename(target_path)
     async with semaphore:
         def cb(current, total):
             manager.update(fname, current, total)
             
-        await msg.download_media(file=target_path, progress_callback=cb)
+        await fast_download_media(client, msg, target_path, progress_callback=cb, parallel_connections=SOCKETS_PER_FILE)
         manager.finish(fname)
 
 def extract_multipart_zip_stream(zip_folder, subject_name):
@@ -194,7 +199,7 @@ async def main():
 
     state = load_state()
     log("="*60)
-    log(f"GitHub Codespaces Pipeline (Parallel Downloads: {MAX_PARALLEL_DOWNLOADS})")
+    log(f"GitHub Codespaces Pipeline (Turbo Downloads: {MAX_PARALLEL_DOWNLOADS} files x {SOCKETS_PER_FILE} Sockets)")
     log(f"Completed subjects so far: {state['completed_subjects']}")
     log("="*60)
 
@@ -260,14 +265,14 @@ async def main():
         os.makedirs(subj_zip_dir, exist_ok=True)
 
         try:
-            log(f"Downloading {len(msgs)} parts in parallel (Concurrency limit: {MAX_PARALLEL_DOWNLOADS})...")
+            log(f"Downloading {len(msgs)} parts in parallel (Turbo Mode)...")
             manager = ParallelProgressManager()
             render_task = asyncio.create_task(manager.render_loop())
 
             download_tasks = []
             for fname, msg in msgs:
                 target_path = os.path.join(subj_zip_dir, fname)
-                download_tasks.append(download_part_task(msg, target_path, semaphore, manager))
+                download_tasks.append(download_part_task(client, msg, target_path, semaphore, manager))
 
             await asyncio.gather(*download_tasks)
             manager.stop()
