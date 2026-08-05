@@ -70,6 +70,28 @@ def parse_subject_name(filename):
     cleaned = re.sub(r'(\.(zip|7z|rar|\d{3}))+$', '', filename, flags=re.IGNORECASE).strip()
     return cleaned if cleaned else filename
 
+def find_existing_file(subj_zip_dir, fname):
+    """Detects existing files on disk even if extra .zip extensions were appended."""
+    if not os.path.exists(subj_zip_dir):
+        return None
+
+    direct = os.path.join(subj_zip_dir, fname)
+    if os.path.exists(direct) and os.path.getsize(direct) > 0:
+        return direct
+
+    # Match part extension (e.g. .001, .002...)
+    match = re.search(r'(\.\d{3})$', fname)
+    part_ext = match.group(1) if match else None
+
+    for existing_f in os.listdir(subj_zip_dir):
+        full_p = os.path.join(subj_zip_dir, existing_f)
+        if os.path.isfile(full_p) and os.path.getsize(full_p) > 0:
+            if part_ext and existing_f.endswith(part_ext):
+                return full_p
+            if existing_f == fname or fname in existing_f:
+                return full_p
+    return None
+
 def make_bar(percentage, length=10):
     filled = int(length * percentage / 100)
     bar = "█" * filled + "░" * (length - filled)
@@ -264,20 +286,20 @@ async def main():
 
         os.makedirs(subj_zip_dir, exist_ok=True)
 
-        # Filter out files that are already 100% downloaded on disk
+        # Smart detection of downloaded parts (matching extension .001, .002...)
         files_to_download = []
         for fname, msg in msgs:
-            target_path = os.path.join(subj_zip_dir, fname)
-            expected_size = msg.file.size if (msg.file and hasattr(msg.file, 'size')) else 0
-            
-            if os.path.exists(target_path) and os.path.getsize(target_path) > 0 and (expected_size == 0 or os.path.getsize(target_path) == expected_size):
-                log(f" [SKIP FILE] '{fname}' ({os.path.getsize(target_path) / (1024*1024):.1f} MB) already exists on disk.")
+            existing = find_existing_file(subj_zip_dir, fname)
+            if existing:
+                size_mb = os.path.getsize(existing) / (1024 * 1024)
+                log(f" [SKIP FILE] Found existing part '{os.path.basename(existing)}' ({size_mb:.1f} MB) on disk.")
             else:
+                target_path = os.path.join(subj_zip_dir, fname)
                 files_to_download.append((fname, msg, target_path))
 
         try:
             if not files_to_download:
-                log(f"[ALL FILES PRESENT] All {len(msgs)} zip parts for '{subject}' already exist in /tmp! Proceeding straight to extraction...")
+                log(f"[ALL FILES PRESENT] All {len(msgs)} zip parts for '{subject}' are present in /tmp! Proceeding straight to extraction...")
             else:
                 log(f"Downloading {len(files_to_download)} remaining parts in parallel...")
                 manager = ParallelProgressManager()
