@@ -6,6 +6,7 @@ import re
 import subprocess
 import asyncio
 import shutil
+import sqlite3
 from collections import defaultdict
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument
@@ -41,6 +42,16 @@ def log(msg):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(text + "\n")
 
+def cleanup_stale_session_locks():
+    """Removes orphan SQLite lock files if a previous python process crashed."""
+    journal_file = os.path.abspath("telegram_session.session-journal")
+    if os.path.exists(journal_file):
+        try:
+            os.remove(journal_file)
+            log("Removed orphaned sqlite session-journal file.")
+        except Exception:
+            pass
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -58,14 +69,14 @@ def parse_subject_name(filename):
     cleaned = re.sub(r'(\.(zip|7z|rar|\d{3}))+$', '', filename, flags=re.IGNORECASE).strip()
     return cleaned if cleaned else filename
 
-def make_bar(percentage, length=20):
+def make_bar(percentage, length=18):
     filled = int(length * percentage / 100)
     bar = "█" * filled + "░" * (length - filled)
     return bar
 
 class ParallelProgressManager:
     """Manages clean inline multi-line progress rendering without terminal bloat."""
-    def __init__ (self):
+    def __init__(self):
         self.stats = {}
         self.running = False
         self.rendered_lines = 0
@@ -89,14 +100,13 @@ class ParallelProgressManager:
         self.running = True
         while self.running:
             self.render()
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.3)
         self.render()
 
     def render(self):
         if not self.stats:
             return
 
-        # Move cursor back up to overwrite previous rendered lines
         if self.rendered_lines > 0:
             sys.stdout.write(f"\x1b[{self.rendered_lines}A")
 
@@ -110,9 +120,8 @@ class ParallelProgressManager:
             bar = make_bar(pct, length=15)
             status_str = "DONE" if st.get('completed') else f"{speed:5.1f} MB/s"
             
-            # Truncate filename if too long for clean display
-            short_name = fname if len(fname) <= 30 else fname[:14] + "..." + fname[-13:]
-            lines.append(f"\x1b[K  ├─ {short_name:<30} [{bar}] {pct:5.1f}% | {curr_mb:6.1f}/{total_mb:6.1f} MB | {status_str}")
+            short_name = fname if len(fname) <= 28 else fname[:13] + "..." + fname[-12:]
+            lines.append(f"\x1b[K  ├─ {short_name:<28} [{bar}] {pct:5.1f}% | {curr_mb:6.1f}/{total_mb:6.1f} MB | {status_str}")
 
         out = "\n".join(lines) + "\n"
         sys.stdout.write(out)
@@ -179,6 +188,7 @@ def upload_to_gdrive_parallel(local_folder, subject_name):
     log(f"Upload completed for {subject_name}!")
 
 async def main():
+    cleanup_stale_session_locks()
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
     os.makedirs(ZIP_DIR, exist_ok=True)
     os.makedirs(EXTRACT_DIR, exist_ok=True)
@@ -190,7 +200,15 @@ async def main():
     log("="*60)
 
     client = TelegramClient('telegram_session', API_ID, API_HASH)
-    await client.start()
+
+    try:
+        await client.start()
+    except sqlite3.OperationalError as e:
+        log(f"SQLite lock error detected: {e}")
+        log("Attempting session recovery...")
+        cleanup_stale_session_locks()
+        await asyncio.sleep(1)
+        await client.start()
 
     log("Fetching Telegram channel message list...")
     entity = None
@@ -243,7 +261,6 @@ async def main():
         os.makedirs(subj_zip_dir, exist_ok=True)
 
         try:
-            # 1. PARALLEL DOWNLOAD WITH CLEAN INLINE DASHBOARD
             log(f"Downloading {len(msgs)} parts in parallel (Concurrency limit: {MAX_PARALLEL_DOWNLOADS})...")
             manager = ParallelProgressManager()
             render_task = asyncio.create_task(manager.render_loop())
