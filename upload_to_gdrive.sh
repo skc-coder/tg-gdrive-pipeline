@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # High-Performance Fast Google Drive Sync Script
-# Uploads ALL files (PDFs, MKVs, PPTs, Docs) in natural name order (Module 01 -> 02 -> 03...)
-# Uses 4 parallel transfers so if 1 file stutters, other files & PDFs keep uploading without blocking.
+# Starts uploading instantly without scanning delays.
 
 LOCAL_PATH="$1"
 REMOTE_NAME="${2:-gdrive}"
@@ -27,8 +26,7 @@ echo "===================================================="
 echo " Starting Fast Parallel Google Drive Upload"
 echo " Local Path:   $LOCAL_PATH"
 echo " Target Drive: $DESTINATION"
-echo " Transfers:    4 Files in Parallel (Includes PDFs & Videos)"
-echo " Order:        Module 01 -> 02 -> 03 ... (Sequential Priority)"
+echo " Transfers:    4 Files in Parallel (Videos & PDFs)"
 echo "===================================================="
 echo ""
 
@@ -36,22 +34,18 @@ rclone copy "$LOCAL_PATH" "$DESTINATION" \
     --progress \
     --transfers 4 \
     --checkers 8 \
-    --order-by "name,ascending" \
-    --fast-list \
     --drive-chunk-size 32M \
     --drive-upload-cutoff 8M \
     --drive-acknowledge-abuse \
-    --drive-pacer-min-sleep 10ms \
-    --timeout 20s \
-    --contimeout 10s \
+    --timeout 30s \
+    --contimeout 15s \
     --low-level-retries 10 \
-    --tpslimit 12 \
     --update \
     --exclude "*.crdownload" \
     --exclude "*.part" \
     --exclude "*.tmp" \
     --retries 5 \
-    --stats 2s
+    --stats 1s
 
 EXIT_CODE=$?
 
