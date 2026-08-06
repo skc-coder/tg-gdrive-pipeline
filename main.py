@@ -29,9 +29,6 @@ MAX_PARALLEL_DOWNLOADS = 3
 
 # Subject processing order specified by user
 PRIORITY_ORDER = [
-    "Compiler Design",
-    "Data Structures",
-    "C Programming",
     "Digital Logic",
     "Algorithms",
     "Operating System"
