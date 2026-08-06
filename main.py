@@ -241,6 +241,13 @@ def extract_multipart_zip(zip_folder, subject_name):
 
     log(f"Successfully extracted split volumes for '{subject_name}'!")
     
+    # Delete original multi-part zips immediately to free disk space!
+    try:
+        shutil.rmtree(zip_folder)
+        log(f"Deleted downloaded multi-part zips in '{zip_folder}' to free disk space!")
+    except Exception as e:
+        log(f"Warning: Could not remove multi-part zip folder: {e}")
+
     # Extract any nested zips found inside the extracted folder
     extract_nested_archives(target_extract_dir)
 
