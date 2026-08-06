@@ -405,7 +405,7 @@ async def main():
 
         try:
             if not files_to_download:
-                log(f"[ALL FILES PRESENT] All {len(msgs)} zip parts for '{subject}' are present in /tmp! Proceeding straight to extraction...")
+                log(f"[ALL FILES PRESENT] All {len(msgs)} zip parts for '{subject}' are present on disk! Proceeding straight to extraction...")
             else:
                 log(f"Downloading {len(files_to_download)} remaining parts in parallel...")
                 manager = ParallelProgressManager()
