@@ -43,8 +43,8 @@ EXCLUDED_SUBJECTS = [
     "COA"
 ]
 
-# Temporary storage partition (/workspaces has 257GB in GitHub Codespaces)
-TEMP_STORAGE_DIR = "/workspaces/tg_pipeline"
+# Temporary storage partition (/mnt/extra_storage has 512GB Disk Space in Codespaces)
+TEMP_STORAGE_DIR = "/mnt/extra_storage/tg_pipeline"
 ZIP_DIR = os.path.join(TEMP_STORAGE_DIR, "zips")
 EXTRACT_DIR = os.path.join(TEMP_STORAGE_DIR, "extracted")
 
