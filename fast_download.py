@@ -48,8 +48,9 @@ async def fast_download_media(client, msg, target_path, progress_callback=None, 
     doc = msg.media.document
     total_size = doc.size
     
+    tmp_path = target_path + ".tmp"
     # Initialize zeroed output file
-    with open(target_path, "wb") as f:
+    with open(tmp_path, "wb") as f:
         f.truncate(total_size)
 
     location = InputDocumentFileLocation(
@@ -67,6 +68,7 @@ async def fast_download_media(client, msg, target_path, progress_callback=None, 
         offset = i * part_size
         size = min(part_size, total_size - offset)
         if size > 0:
-            tasks.append(download_part(client, location, offset, size, target_path, progress_callback, downloaded_tracker, total_size))
+            tasks.append(download_part(client, location, offset, size, tmp_path, progress_callback, downloaded_tracker, total_size))
 
     await asyncio.gather(*tasks)
+    os.rename(tmp_path, target_path)
