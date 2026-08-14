@@ -136,7 +136,7 @@ class ParallelTransferrer:
 
         await self._cleanup()
 
-async def download_file_fast(client: TelegramClient, location: TypeLocation, target_path: str, progress_callback=None, connection_count=16):
+async def download_file_fast(client: TelegramClient, location: TypeLocation, target_path: str, progress_callback=None, connection_count=6):
     size = location.size
     dc_id, location = utils.get_input_location(location)
     downloader = ParallelTransferrer(client, dc_id)
@@ -153,10 +153,10 @@ async def download_file_fast(client: TelegramClient, location: TypeLocation, tar
     if os.path.exists(tmp_path):
         os.rename(tmp_path, target_path)
 
-async def fast_download_media(client, msg, target_path, progress_callback=None, parallel_connections=16):
+async def fast_download_media(client, msg, target_path, progress_callback=None, parallel_connections=6):
     """
     FastTelethon multi-connection parallel file downloader.
-    Uses 16 MTProto connections & auth export to saturate bandwidth.
+    Uses 6 optimal MTProto connections to maintain steady 10-15MB/s speed without triggering Telegram server throttles.
     """
     if not msg.media or not hasattr(msg.media, 'document') or not msg.media.document:
         tmp_path = target_path + ".tmp"
