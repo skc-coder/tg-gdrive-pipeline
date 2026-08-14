@@ -89,14 +89,15 @@ def get_subject_priority(subject):
             return idx
     return 999
 
-def find_existing_file(subj_zip_dir, fname):
-    """Detects existing files on disk even if extra .zip extensions were appended."""
+def find_existing_file(subj_zip_dir, fname, expected_size=None):
+    """Detects existing completed files on disk."""
     if not os.path.exists(subj_zip_dir):
         return None
 
     direct = os.path.join(subj_zip_dir, fname)
     if os.path.exists(direct) and os.path.getsize(direct) > 0:
-        return direct
+        if expected_size is None or os.path.getsize(direct) >= expected_size:
+            return direct
 
     match = re.search(r'(\.\d{3})$', fname)
     part_ext = match.group(1) if match else None
@@ -104,10 +105,11 @@ def find_existing_file(subj_zip_dir, fname):
     for existing_f in os.listdir(subj_zip_dir):
         full_p = os.path.join(subj_zip_dir, existing_f)
         if os.path.isfile(full_p) and os.path.getsize(full_p) > 0:
-            if part_ext and existing_f.endswith(part_ext):
-                return full_p
-            if existing_f == fname or fname in existing_f:
-                return full_p
+            if expected_size is None or os.path.getsize(full_p) >= expected_size:
+                if part_ext and existing_f.endswith(part_ext):
+                    return full_p
+                if existing_f == fname or fname in existing_f:
+                    return full_p
     return None
 
 def make_bar(percentage, length=10):
@@ -392,10 +394,11 @@ async def main():
 
         files_to_download = []
         for fname, msg in msgs:
-            existing = find_existing_file(subj_zip_dir, fname)
+            expected_size = msg.media.document.size if (msg.media and hasattr(msg.media, 'document')) else None
+            existing = find_existing_file(subj_zip_dir, fname, expected_size=expected_size)
             if existing:
                 size_mb = os.path.getsize(existing) / (1024 * 1024)
-                log(f" [SKIP FILE] Found existing part '{os.path.basename(existing)}' ({size_mb:.1f} MB) on disk.")
+                log(f" [SKIP FILE] Found completed part '{os.path.basename(existing)}' ({size_mb:.1f} MB) on disk.")
             else:
                 target_path = os.path.join(subj_zip_dir, fname)
                 files_to_download.append((fname, msg, target_path))
