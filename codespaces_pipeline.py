@@ -21,8 +21,8 @@ RCLONE_REMOTE = "gdrive:GATE_Courses"
 # Parallel upload threads for rclone
 RCLONE_TRANSFERS = "5"
 
-# Optimized paths for GitHub Codespaces (Using /mnt/extra_storage partition - 512GB Disk Space!)
-TEMP_STORAGE_DIR = "/mnt/extra_storage/tg_pipeline"
+# Optimized paths for GitHub Codespaces (Using /tmp partition - 45GB Disk Space!)
+TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
 ZIP_DIR = os.path.join(TEMP_STORAGE_DIR, "zips")
 EXTRACT_DIR = os.path.join(TEMP_STORAGE_DIR, "extracted")
 
