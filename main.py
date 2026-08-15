@@ -24,8 +24,8 @@ RCLONE_REMOTE = "gdrive:GATE_Courses"
 # Parallel upload threads for rclone
 RCLONE_TRANSFERS = "5"
 
-# Max parallel file downloads (1 file at a time sequentially to concentrate maximum speed per file)
-MAX_PARALLEL_DOWNLOADS = 1
+# Max parallel file downloads (10 files at once - downloads all parts of a subject concurrently)
+MAX_PARALLEL_DOWNLOADS = 10
 
 # Subject processing order specified by user
 PRIORITY_ORDER = [
