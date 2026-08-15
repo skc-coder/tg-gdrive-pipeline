@@ -24,16 +24,16 @@ RCLONE_REMOTE = "gdrive:GATE_Courses"
 # Parallel upload threads for rclone
 RCLONE_TRANSFERS = "5"
 
-# Max parallel file downloads (10 files at once - downloads all parts of a subject concurrently)
-MAX_PARALLEL_DOWNLOADS = 10
+# Max parallel file downloads (3 files at once)
+MAX_PARALLEL_DOWNLOADS = 3
 
-# Subject processing order specified by user (Algorithms at the very end)
+# Subject processing order specified by user (Digital Logic then Algorithms at the very end)
 PRIORITY_ORDER = [
-    "Digital Logic",
     "Operating System",
     "Data Structures",
     "Compiler Design",
     "C Programming",
+    "Digital Logic",
     "Algorithms"
 ]
 
