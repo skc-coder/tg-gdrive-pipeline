@@ -149,6 +149,16 @@ class ParallelProgressManager:
             await asyncio.sleep(0.4)
         self.render()
 
+    def format_time(self, seconds):
+        if seconds < 0 or seconds == float('inf'):
+            return "--:--"
+        secs = int(seconds)
+        mins, s = divmod(secs, 60)
+        hrs, m = divmod(mins, 60)
+        if hrs > 0:
+            return f"{hrs:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
     def render(self):
         if not self.stats:
             return
@@ -157,17 +167,38 @@ class ParallelProgressManager:
             sys.stdout.write(f"\x1b[{self.rendered_lines}A")
 
         lines = ["\x1b[KActive Parallel Downloads:"]
+        total_remaining_bytes = 0
+        total_speed_mb = 0.0
+
         for fname, st in list(self.stats.items()):
-            curr_mb = st['current'] / (1024 * 1024)
-            total_mb = st['total'] / (1024 * 1024) if st['total'] > 0 else 1.0
-            pct = (st['current'] / st['total'] * 100) if st['total'] > 0 else 0.0
+            curr_bytes = st['current']
+            tot_bytes = st['total']
+            curr_mb = curr_bytes / (1024 * 1024)
+            total_mb = tot_bytes / (1024 * 1024) if tot_bytes > 0 else 1.0
+            pct = (curr_bytes / tot_bytes * 100) if tot_bytes > 0 else 0.0
             speed = st.get('speed', 0.0)
             bar = make_bar(pct, length=10)
-            status_str = "DONE" if st.get('completed') else f"{speed:4.1f} MB/s"
+
+            if st.get('completed'):
+                status_str = "DONE"
+            else:
+                rem_bytes = max(0, tot_bytes - curr_bytes)
+                total_remaining_bytes += rem_bytes
+                total_speed_mb += speed
+                speed_bytes = speed * 1024 * 1024
+                eta_sec = (rem_bytes / speed_bytes) if speed_bytes > 0 else float('inf')
+                eta_str = self.format_time(eta_sec)
+                status_str = f"{speed:4.1f} MB/s | ETA: {eta_str}"
             
             short_name = fname if len(fname) <= 18 else fname[:8] + "..." + fname[-7:]
             line = f"\x1b[K  ├─ {short_name:<18} [{bar}] {pct:5.1f}% | {curr_mb:4.0f}/{total_mb:4.0f}MB | {status_str}"
-            lines.append(line[:75])
+            lines.append(line[:85])
+
+        if total_speed_mb > 0 and total_remaining_bytes > 0:
+            tot_speed_bytes = total_speed_mb * 1024 * 1024
+            total_eta_sec = total_remaining_bytes / tot_speed_bytes
+            tot_eta_str = self.format_time(total_eta_sec)
+            lines.append(f"\x1b[K  └─ Overall Speed: {total_speed_mb:4.1f} MB/s | Total Time Remaining: {tot_eta_str}".rstrip()[:85])
 
         out = "\n".join(lines) + "\n"
         sys.stdout.write(out)
