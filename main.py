@@ -457,11 +457,7 @@ async def main():
             # 2. Extract multi-part zips (.001, .002...) and any inner nested zips
             extract_multipart_zip(subj_zip_dir, subject)
 
-            # 3. Delete raw zips immediately to free space in /tmp
-            log(f"Cleaning raw zips for '{subject}'...")
-            shutil.rmtree(subj_zip_dir)
-
-            # 4. Upload extracted files in 5 parallel transfers to Google Drive via rclone
+            # 3. Upload extracted files in 5 parallel transfers to Google Drive via rclone
             upload_to_gdrive_parallel(subj_extract_dir, subject)
 
             # 5. Delete extracted files from /tmp
