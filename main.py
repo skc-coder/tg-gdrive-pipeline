@@ -183,7 +183,7 @@ async def download_part_task(client, msg, target_path, semaphore, manager):
         def cb(current, total):
             manager.update(fname, current, total)
             
-        await fast_download_media(client, msg, target_path, progress_callback=cb)
+        await fast_download_media(client, msg, target_path, progress_callback=cb, parallel_connections=6)
         manager.finish(fname)
 
 def extract_nested_archives(folder_path):
