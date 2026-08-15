@@ -23,12 +23,12 @@ Automated tool to download multi-part split zips from Telegram channels, extract
 
 * **Pull & Run (Update & Execute)**:
   ```bash
-  git pull && ./venv/bin/python main.py
+  git pull && bash setup.sh && ./venv/bin/python main.py
   ```
 
 * **One-Liner Clone / Pull & Run**:
   ```bash
-  (git clone https://github.com/skc-coder/tg-gdrive-pipeline.git && cd tg-gdrive-pipeline) || (git pull) && ./venv/bin/python main.py
+  (git clone https://github.com/skc-coder/tg-gdrive-pipeline.git && cd tg-gdrive-pipeline) || (git pull) && bash setup.sh && ./venv/bin/python main.py
   ```
 
 ## Features
