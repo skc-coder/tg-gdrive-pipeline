@@ -14,6 +14,23 @@ Automated tool to download multi-part split zips from Telegram channels, extract
    ./venv/bin/python main.py
    ```
 
+## Fast One-Liner Commands
+
+* **Clone & Run (First Time)**:
+  ```bash
+  git clone https://github.com/skc-coder/tg-gdrive-pipeline.git && cd tg-gdrive-pipeline && bash setup.sh && ./venv/bin/python main.py
+  ```
+
+* **Pull & Run (Update & Execute)**:
+  ```bash
+  git pull && ./venv/bin/python main.py
+  ```
+
+* **One-Liner Clone / Pull & Run**:
+  ```bash
+  (git clone https://github.com/skc-coder/tg-gdrive-pipeline.git && cd tg-gdrive-pipeline) || (git pull) && ./venv/bin/python main.py
+  ```
+
 ## Features
 - **45GB `/tmp` Storage Optimization**: Handles massive 15GB–30GB subjects cleanly.
 - **Stream Pipe Extraction**: ZERO extra disk overhead when extracting `.zip.001`, `.zip.002` split archives.
