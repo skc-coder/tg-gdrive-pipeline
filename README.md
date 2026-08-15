@@ -14,22 +14,19 @@ Automated tool to download multi-part split zips from Telegram channels, extract
    ./venv/bin/python main.py
    ```
 
-## Fast One-Liner Commands
+## Fast Commands
 
-* **Clone & Run (First Time)**:
-  ```bash
-  git clone https://github.com/skc-coder/tg-gdrive-pipeline.git && cd tg-gdrive-pipeline && bash setup.sh && ./venv/bin/python main.py
-  ```
+### Pull Latest Code & Run Script (Use this to update and run):
+```bash
+git pull && ./venv/bin/python main.py
+```
 
-* **Pull & Run (Update & Execute)**:
-  ```bash
-  git pull && bash setup.sh && ./venv/bin/python main.py
-  ```
+### Or Pull, Setup Dependencies & Run:
+```bash
+git pull && bash setup.sh && ./venv/bin/python main.py
+```
 
-* **One-Liner Clone / Pull & Run**:
-  ```bash
-  (git clone https://github.com/skc-coder/tg-gdrive-pipeline.git && cd tg-gdrive-pipeline) || (git pull) && bash setup.sh && ./venv/bin/python main.py
-  ```
+## Quick Start on GitHub Codespaces
 
 ## Features
 - **45GB `/tmp` Storage Optimization**: Handles massive 15GB–30GB subjects cleanly.
