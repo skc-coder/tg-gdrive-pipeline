@@ -27,11 +27,14 @@ RCLONE_TRANSFERS = "5"
 # Max parallel file downloads (10 files at once - downloads all parts of a subject concurrently)
 MAX_PARALLEL_DOWNLOADS = 10
 
-# Subject processing order specified by user
+# Subject processing order specified by user (Algorithms at the very end)
 PRIORITY_ORDER = [
     "Digital Logic",
-    "Algorithms",
-    "Operating System"
+    "Operating System",
+    "Data Structures",
+    "Compiler Design",
+    "C Programming",
+    "Algorithms"
 ]
 
 # Explicitly excluded subjects
