@@ -1,64 +1,57 @@
 # Telegram Channel to Google Drive Pipeline
 
-Automated tool to download multi-part split zips from Telegram channels, extract them on-the-fly, and upload lectures to Google Drive in parallel, optimized for GitHub Codespaces.
+Automated tool to download files, videos, and multi-part split zips from Telegram channels, extract them on-the-fly, and upload them to Google Drive in parallel, optimized for GitHub Codespaces.
 
 ---
 
-## 🚀 How to Launch the Server / Pipeline
+## 📋 How to Add / Configure Your Channels
 
-### 1. Initial Setup (First Time Only)
-Run the setup script to install dependencies (`7zip`, `rclone`, `virtualenv`) and configure Google Drive access:
-```bash
-bash setup.sh
+Channels are configured in `channels.json` in the root folder. You can add as many channels as you want:
+
+```json
+[
+    {
+        "channel_id": -1002107557406,
+        "remote_folder": "GATE_Courses",
+        "name": "Primary GATE Channel"
+    },
+    {
+        "channel_id": -1001234567890,
+        "remote_folder": "Physics_Lectures",
+        "name": "Physics Channel"
+    }
+]
 ```
 
-### 2. Launch the Pipeline / Server
-To start the pipeline execution:
-```bash
-cd tg-gdrive-pipeline/
-git pull && ./venv/bin/python main.py
-```
-
-### 3. Quick Pull & Run Command
-If you want to pull the latest changes from Git and run the server immediately:
-```bash
-git pull && ./venv/bin/python main.py
-```
+- **`channel_id`**: The Telegram channel ID (e.g. `-1002107557406` or `@channel_username`).
+- **`remote_folder`**: The subfolder in Google Drive where files from this channel will be saved.
+- **`name`**: Friendly name for logs and status UI.
 
 ---
 
-## 📤 How to Git Push (Saving & Uploading Changes)
+## 🚀 How to Pull & Run (Exact Commands)
 
-When you make changes to the codebase and want to push them to GitHub:
+To pull the latest code update and run the pipeline immediately:
 
-### Step 1: Check modified files
 ```bash
-git status
+git pull && ./venv/bin/python main.py
 ```
 
-### Step 2: Stage changes
+Or step by step:
 ```bash
-git add .
+git pull
+./venv/bin/python main.py
 ```
-
-### Step 3: Commit changes with a message
-```bash
-git commit -m "Your descriptive commit message"
-```
-
-### Step 4: Push changes to GitHub
-```bash
-git push
-```
-
-*Note: If pushing for the first time on a new branch, use `git push -u origin <branch-name>`.*
 
 ---
 
 ## ⚡ Features
-- **45GB `/tmp` Storage Optimization**: Handles massive 15GB–30GB subjects cleanly.
-- **Stream Pipe Extraction**: ZERO extra disk overhead when extracting `.zip.001`, `.zip.002` split archives.
-- **Parallel Google Drive Uploads**: Uses 5 parallel threads (`rclone`) for fast transfers.
-- **Automatic Disk Cleanup**: Deletes zips and extracted files immediately after upload.
-- **Smart Resume / State Persistence**: Saves progress in `pipeline_data/state.json`. If disconnected, re-running skips completed subjects.
+- **General File Support**: Works for PDFs, Videos (MP4), Documents, and ZIP files.
+- **Smart Disk Management**: Auto-flushes & uploads to Google Drive if `/tmp` storage drops below 8GB.
+- **Standard Telegram Speeds**: Uses 3 parallel downloads to prevent speed throttling.
+- **5 Parallel Rclone Uploads**: Transfers to Google Drive concurrently.
+- **Multi-Part & Recursive Extraction**: Automatically extracts `.zip.001` split archives and inner nested zips.
+- **Live Terminal Dashboard**: Shows active download ETA/speed, upload status, and free disk space.
+- **State Resuming**: Keeps track of processed messages in `pipeline_data/state.json`.
+
 

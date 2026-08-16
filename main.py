@@ -16,23 +16,36 @@ API_ID = 21601842
 API_HASH = "b824abd0e19c6c67b0b38ec8d470ba03"
 
 # List of Telegram channels to process in order
-# Each entry is a dict with:
-#   "channel_id": Telegram channel ID or username
-#   "remote_folder": Google Drive target subfolder (under RCLONE_REMOTE)
-#   "name": Friendly channel display name
-CHANNELS = [
+# Can also be managed via channels.json file in the root directory!
+DEFAULT_CHANNELS = [
     {
         "channel_id": -1002107557406,
         "remote_folder": "GATE_Courses",
         "name": "Primary GATE Channel"
     }
-    # Add additional channels here, e.g.:
-    # {
-    #     "channel_id": -1001234567890,
-    #     "remote_folder": "Other_Channel_Docs",
-    #     "name": "General Notes & Videos Channel"
-    # }
 ]
+
+CHANNELS_FILE = os.path.abspath("channels.json")
+
+def load_channels():
+    if os.path.exists(CHANNELS_FILE):
+        try:
+            with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
+                chans = json.load(f)
+                if isinstance(chans, list) and len(chans) > 0:
+                    return chans
+        except Exception as e:
+            print(f"[WARNING] Could not parse channels.json: {e}")
+    # Write default channels.json if it doesn't exist
+    try:
+        with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CHANNELS, f, indent=4)
+    except Exception:
+        pass
+    return DEFAULT_CHANNELS
+
+CHANNELS = load_channels()
+
 
 # Base Google Drive rclone remote
 RCLONE_REMOTE = "gdrive:"
