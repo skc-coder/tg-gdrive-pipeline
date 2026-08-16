@@ -32,6 +32,7 @@ MAX_PARALLEL_DOWNLOADS = 3
 # 2. Compiler Design
 # 3. C Programming
 # 4. Digital Logic
+# (Any other subjects found on Telegram will automatically be processed afterwards)
 PRIORITY_ORDER = [
     "Operating System",
     "Compiler Design",
@@ -39,7 +40,7 @@ PRIORITY_ORDER = [
     "Digital Logic"
 ]
 
-# Explicitly excluded subjects (already downloaded / user requested to skip)
+# Explicitly excluded subjects (already downloaded in GDrive)
 EXCLUDED_SUBJECTS = [
     "Data Structures",
     "Algorithms",
