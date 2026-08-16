@@ -3,5 +3,10 @@
         "channel_id": -1002107557406,
         "remote_folder": "GATE_Courses",
         "name": "Primary GATE Channel"
+    },
+    {
+        "channel_id": "CDS_Foundation_IMA_2026",
+        "remote_folder": "CDS_Foundation_IMA_2026",
+        "name": "CDS Foundation IMA 2026"
     }
 ]
