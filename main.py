@@ -24,8 +24,8 @@ RCLONE_REMOTE = "gdrive:GATE_Courses"
 # Parallel upload threads for rclone
 RCLONE_TRANSFERS = "5"
 
-# Max parallel file downloads (4 files at once)
-MAX_PARALLEL_DOWNLOADS = 4
+# Max parallel file downloads (3 files at once)
+MAX_PARALLEL_DOWNLOADS = 3
 
 # Subject processing order specified by user:
 # 1. Operating System
@@ -219,7 +219,7 @@ async def download_part_task(client, msg, target_path, semaphore, manager):
         def cb(current, total):
             manager.update(fname, current, total)
             
-        await fast_download_media(client, msg, target_path, progress_callback=cb, parallel_connections=16)
+        await fast_download_media(client, msg, target_path, progress_callback=cb, parallel_connections=6)
         manager.finish(fname)
 
 def extract_nested_archives(folder_path):
