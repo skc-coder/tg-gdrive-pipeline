@@ -87,17 +87,27 @@ def cleanup_stale_session_locks():
             pass
 
 def load_state():
+    state = {
+        "completed_channels": [],
+        "downloaded_msg_ids": {},
+        "uploaded_files": {},
+    }
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    state.update(loaded)
         except Exception:
             pass
-    return {
-        "completed_channels": [],
-        "downloaded_msg_ids": {}, # channel_id_str -> list of msg_ids
-        "uploaded_files": {},     # channel_id_str -> list of file keys / names
-    }
+    if "completed_channels" not in state:
+        state["completed_channels"] = []
+    if "downloaded_msg_ids" not in state:
+        state["downloaded_msg_ids"] = {}
+    if "uploaded_files" not in state:
+        state["uploaded_files"] = {}
+    return state
+
 
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
