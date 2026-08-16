@@ -395,28 +395,22 @@ async def process_channel(client, channel_info, state, status_tracker):
     os.makedirs(chan_dl_dir, exist_ok=True)
     os.makedirs(chan_ext_dir, exist_ok=True)
 
-    for msg in messages_to_process:
+    async def download_worker(msg):
         fname = msg.file.name
         target_path = os.path.join(chan_dl_dir, fname)
 
         # Check storage space on /tmp before downloading
         _, _, free_bytes = shutil.disk_usage(TEMP_STORAGE_DIR)
         if free_bytes < MIN_FREE_DISK_BYTES:
-            log(f"DISK SPACE LOW ({free_bytes / (1024**3):.2f} GB free). Uploading and clearing disk queue first...")
-            # Extract & upload whatever is currently in extract / download dir
-            extract_multipart_zip_if_needed(chan_dl_dir, chan_ext_dir)
-            remote_target = f"{RCLONE_REMOTE}/{remote_folder}"
-            await upload_folder_gdrive(chan_ext_dir, remote_target, status_tracker)
-            shutil.rmtree(chan_ext_dir, ignore_errors=True)
-            os.makedirs(chan_ext_dir, exist_ok=True)
-            log("Disk space freed after upload! Resuming downloads...")
+            log(f"DISK SPACE LOW ({free_bytes / (1024**3):.2f} GB free). Pausing download...")
+            while shutil.disk_usage(TEMP_STORAGE_DIR)[2] < MIN_FREE_DISK_BYTES:
+                await asyncio.sleep(5)
 
         async with dl_semaphore:
             def dl_cb(current, total):
                 status_tracker.update_download(fname, current, total)
 
             log(f"Downloading message {msg.id}: {fname}...")
-            # Standard Telethon download (No speed-hacking multi-connection)
             await msg.download_media(file=target_path, progress_callback=dl_cb)
             status_tracker.finish_download(fname)
             
@@ -424,8 +418,13 @@ async def process_channel(client, channel_info, state, status_tracker):
             state["downloaded_msg_ids"][chan_key].append(msg.id)
             save_state(state)
 
-        # After each download, extract zip / prepare for upload
+        # After download, extract zip / prepare for upload
         extract_multipart_zip_if_needed(target_path, chan_ext_dir)
+
+    # Launch parallel downloads batch
+    tasks = [download_worker(m) for m in messages_to_process]
+    await asyncio.gather(*tasks)
+
 
     # Final upload of remaining extracted files for this channel
     if os.path.exists(chan_ext_dir) and os.listdir(chan_ext_dir):
