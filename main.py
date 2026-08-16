@@ -11,6 +11,9 @@ from collections import defaultdict
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument
 
+from fast_download import fast_download_media
+
+
 # ==================== CONFIGURATION ====================
 API_ID = 21601842
 API_HASH = "b824abd0e19c6c67b0b38ec8d470ba03"
@@ -392,12 +395,10 @@ async def process_channel(client, channel_info, state, status_tracker):
     
     chan_dl_dir = os.path.join(DOWNLOAD_DIR, chan_key)
     chan_ext_dir = os.path.join(EXTRACT_DIR, chan_key)
-    os.makedirs(chan_dl_dir, exist_ok=True)
-    os.makedirs(chan_ext_dir, exist_ok=True)
-
     async def download_worker(msg):
         fname = msg.file.name
         target_path = os.path.join(chan_dl_dir, fname)
+
 
         # Check storage space on /tmp before downloading
         _, _, free_bytes = shutil.disk_usage(TEMP_STORAGE_DIR)
@@ -411,7 +412,8 @@ async def process_channel(client, channel_info, state, status_tracker):
                 status_tracker.update_download(fname, current, total)
 
             log(f"Downloading message {msg.id}: {fname}...")
-            await msg.download_media(file=target_path, progress_callback=dl_cb)
+            # Multi-connection download (from commit c8c9c50)
+            await fast_download_media(client, msg, target_path, progress_callback=dl_cb, parallel_connections=6)
             status_tracker.finish_download(fname)
             
             # Track state
@@ -424,6 +426,7 @@ async def process_channel(client, channel_info, state, status_tracker):
     # Launch parallel downloads batch
     tasks = [download_worker(m) for m in messages_to_process]
     await asyncio.gather(*tasks)
+
 
 
     # Final upload of remaining extracted files for this channel
