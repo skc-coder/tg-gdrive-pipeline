@@ -11,49 +11,48 @@ from collections import defaultdict
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument
 
-from fast_download import fast_download_media
-
 # ==================== CONFIGURATION ====================
 API_ID = 21601842
 API_HASH = "b824abd0e19c6c67b0b38ec8d470ba03"
-CHANNEL_ID = -1002107557406
 
-# Google Drive remote name configured in rclone (e.g. "gdrive:GATE_Courses")
-RCLONE_REMOTE = "gdrive:GATE_Courses"
+# List of Telegram channels to process in order
+# Each entry is a dict with:
+#   "channel_id": Telegram channel ID or username
+#   "remote_folder": Google Drive target subfolder (under RCLONE_REMOTE)
+#   "name": Friendly channel display name
+CHANNELS = [
+    {
+        "channel_id": -1002107557406,
+        "remote_folder": "GATE_Courses",
+        "name": "Primary GATE Channel"
+    }
+    # Add additional channels here, e.g.:
+    # {
+    #     "channel_id": -1001234567890,
+    #     "remote_folder": "Other_Channel_Docs",
+    #     "name": "General Notes & Videos Channel"
+    # }
+]
+
+# Base Google Drive rclone remote
+RCLONE_REMOTE = "gdrive:"
 
 # Parallel upload threads for rclone
-RCLONE_TRANSFERS = "5"
+RCLONE_TRANSFERS = 5
 
-# Max parallel file downloads (3 files at once)
+# Max parallel file downloads from Telegram (using standard Telethon)
 MAX_PARALLEL_DOWNLOADS = 3
 
-# Subject processing order specified by user:
-# 1. Operating System
-# 2. Compiler Design
-# 3. C Programming
-# 4. Digital Logic
-# (Any other subjects found on Telegram will automatically be processed afterwards)
-PRIORITY_ORDER = [
-    "Operating System",
-    "Compiler Design",
-    "C Programming",
-    "Digital Logic"
-]
+# Storage safety thresholds (in Bytes) for /tmp partition (~40GB total on Codespaces)
+# If free disk space drops below MIN_FREE_DISK_BYTES, downloads pause until uploads clean space.
+MIN_FREE_DISK_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB minimum free buffer
 
-# Explicitly excluded subjects (already downloaded in GDrive)
-EXCLUDED_SUBJECTS = [
-    "Data Structures",
-    "Algorithms",
-    "Computer Organization & Architecture",
-    "COA"
-]
-
-# Temporary storage partition (/tmp has ~45GB in GitHub Codespaces)
+# Temporary storage partitions
 TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
-ZIP_DIR = os.path.join(TEMP_STORAGE_DIR, "zips")
+DOWNLOAD_DIR = os.path.join(TEMP_STORAGE_DIR, "downloads")
 EXTRACT_DIR = os.path.join(TEMP_STORAGE_DIR, "extracted")
 
-# Persistent storage paths in workspace root
+# Persistent state & logs
 WORKSPACE_DIR = os.path.abspath("./pipeline_data")
 STATE_FILE = os.path.join(WORKSPACE_DIR, "state.json")
 LOG_FILE = os.path.join(WORKSPACE_DIR, "pipeline.log")
@@ -81,129 +80,126 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"completed_subjects": [], "failed_subjects": []}
+    return {
+        "completed_channels": [],
+        "downloaded_msg_ids": {}, # channel_id_str -> list of msg_ids
+        "uploaded_files": {},     # channel_id_str -> list of file keys / names
+    }
 
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=4)
 
-def parse_subject_name(filename):
-    cleaned = re.sub(r'(\.(zip|7z|rar|\d{3}))+$', '', filename, flags=re.IGNORECASE).strip()
-    return cleaned if cleaned else filename
-
-def get_subject_priority(subject):
-    for idx, p in enumerate(PRIORITY_ORDER):
-        if p.lower() in subject.lower():
-            return idx
-    return 999
-
-def find_existing_file(subj_zip_dir, fname, expected_size=None):
-    """Detects existing completed files on disk."""
-    if not os.path.exists(subj_zip_dir):
-        return None
-
-    direct = os.path.join(subj_zip_dir, fname)
-    if os.path.exists(direct) and os.path.getsize(direct) > 0:
-        if expected_size is None or os.path.getsize(direct) >= expected_size:
-            return direct
-
-    match = re.search(r'(\.\d{3})$', fname)
-    part_ext = match.group(1) if match else None
-
-    for existing_f in os.listdir(subj_zip_dir):
-        full_p = os.path.join(subj_zip_dir, existing_f)
-        if os.path.isfile(full_p) and os.path.getsize(full_p) > 0:
-            if expected_size is None or os.path.getsize(full_p) >= expected_size:
-                if part_ext and existing_f.endswith(part_ext):
-                    return full_p
-                if existing_f == fname or fname in existing_f:
-                    return full_p
-    return None
-
 def make_bar(percentage, length=10):
-    filled = int(length * percentage / 100)
-    bar = "█" * filled + "░" * (length - filled)
-    return bar
+    filled = int(length * max(0.0, min(100.0, percentage)) / 100)
+    return "█" * filled + "░" * (length - filled)
 
-class ParallelProgressManager:
-    """Manages clean inline multi-line progress rendering without line wrapping."""
+def format_time(seconds):
+    if seconds < 0 or seconds == float('inf') or math.isnan(seconds):
+        return "--:--"
+    secs = int(seconds)
+    mins, s = divmod(secs, 60)
+    hrs, m = divmod(mins, 60)
+    if hrs > 0:
+        return f"{hrs:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+import math
+
+class StatusTracker:
     def __init__(self):
-        self.stats = {}
-        self.running = False
+        self.downloads = {}  # fname -> {start, current, total, speed, completed}
+        self.uploads = {}    # fname -> {start, current, total, speed, status}
         self.rendered_lines = 0
+        self.running = False
 
-    def update(self, fname, current, total):
+    def update_download(self, fname, current, total):
         now = time.time()
-        if fname not in self.stats:
-            self.stats[fname] = {'start': now, 'current': current, 'total': total, 'speed': 0.0}
+        if fname not in self.downloads:
+            self.downloads[fname] = {'start': now, 'current': current, 'total': total, 'speed': 0.0, 'completed': False}
         else:
-            st = self.stats[fname]
+            st = self.downloads[fname]
             elapsed = max(now - st['start'], 0.001)
             st['current'] = current
             st['total'] = total
             st['speed'] = (current / (1024 * 1024)) / elapsed
 
-    def finish(self, fname):
-        if fname in self.stats:
-            self.stats[fname]['completed'] = True
+    def finish_download(self, fname):
+        if fname in self.downloads:
+            self.downloads[fname]['completed'] = True
+
+    def update_upload(self, fname, current, total, status="Uploading"):
+        now = time.time()
+        if fname not in self.uploads:
+            self.uploads[fname] = {'start': now, 'current': current, 'total': total, 'speed': 0.0, 'status': status}
+        else:
+            st = self.uploads[fname]
+            elapsed = max(now - st['start'], 0.001)
+            st['current'] = current
+            st['total'] = total
+            st['speed'] = (current / (1024 * 1024)) / elapsed
+            st['status'] = status
+
+    def finish_upload(self, fname):
+        if fname in self.uploads:
+            self.uploads[fname]['status'] = "DONE"
+            self.uploads[fname]['current'] = self.uploads[fname]['total']
 
     async def render_loop(self):
         self.running = True
         while self.running:
             self.render()
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
         self.render()
 
-    def format_time(self, seconds):
-        if seconds < 0 or seconds == float('inf'):
-            return "--:--"
-        secs = int(seconds)
-        mins, s = divmod(secs, 60)
-        hrs, m = divmod(mins, 60)
-        if hrs > 0:
-            return f"{hrs:02d}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
-
     def render(self):
-        if not self.stats:
-            return
+        total, used, free = shutil.disk_usage(TEMP_STORAGE_DIR)
+        free_gb = free / (1024 ** 3)
+        total_gb = total / (1024 ** 3)
+
+        lines = []
+        lines.append(f"\x1b[K=================== PIPELINE STATUS Dashboard ===================")
+        lines.append(f"\x1b[KStorage (/tmp): {free_gb:.1f} GB free of {total_gb:.1f} GB | Min Buffer: {MIN_FREE_DISK_BYTES/(1024**3):.1f} GB")
+        
+        # Download section
+        active_dl = {k: v for k, v in self.downloads.items() if not v.get('completed')}
+        lines.append(f"\x1b[KActive Downloads ({len(active_dl)} / {MAX_PARALLEL_DOWNLOADS}):")
+        tot_dl_speed = 0.0
+        tot_dl_rem = 0
+        for fname, st in list(active_dl.items())[-MAX_PARALLEL_DOWNLOADS:]:
+            curr_bytes = st['current']
+            tot_bytes = st['total']
+            pct = (curr_bytes / tot_bytes * 100) if tot_bytes > 0 else 0.0
+            speed = st.get('speed', 0.0)
+            tot_dl_speed += speed
+            rem_b = max(0, tot_bytes - curr_bytes)
+            tot_dl_rem += rem_b
+            eta = format_time(rem_b / (speed * 1024 * 1024)) if speed > 0 else "--:--"
+            bar = make_bar(pct, length=10)
+            sname = fname if len(fname) <= 20 else fname[:9] + "..." + fname[-8:]
+            lines.append(f"\x1b[K  [DL] {sname:<20} [{bar}] {pct:5.1f}% | {curr_bytes/(1024**2):4.0f}/{tot_bytes/(1024**2):4.0f}MB | {speed:4.1f}MB/s | ETA:{eta}")
+
+        if tot_dl_speed > 0:
+            overall_dl_eta = format_time(tot_dl_rem / (tot_dl_speed * 1024 * 1024))
+            lines.append(f"\x1b[K  └─ Total Download Speed: {tot_dl_speed:4.1f} MB/s | Combined ETA: {overall_dl_eta}")
+
+        # Upload section
+        active_ul = {k: v for k, v in self.uploads.items() if v.get('status') != "DONE"}
+        lines.append(f"\x1b[KActive Uploads ({len(active_ul)} / {RCLONE_TRANSFERS} workers):")
+        for fname, st in list(active_ul.items())[-RCLONE_TRANSFERS:]:
+            curr_bytes = st['current']
+            tot_bytes = st['total']
+            pct = (curr_bytes / tot_bytes * 100) if tot_bytes > 0 else 0.0
+            speed = st.get('speed', 0.0)
+            status = st.get('status', 'Uploading')
+            bar = make_bar(pct, length=10)
+            sname = fname if len(fname) <= 20 else fname[:9] + "..." + fname[-8:]
+            lines.append(f"\x1b[K  [UL] {sname:<20} [{bar}] {pct:5.1f}% | {status} | {speed:4.1f}MB/s")
+
+        lines.append(f"\x1b[K================================================================")
 
         if self.rendered_lines > 0:
             sys.stdout.write(f"\x1b[{self.rendered_lines}A")
-
-        lines = ["\x1b[KActive Parallel Downloads:"]
-        total_remaining_bytes = 0
-        total_speed_mb = 0.0
-
-        for fname, st in list(self.stats.items()):
-            curr_bytes = st['current']
-            tot_bytes = st['total']
-            curr_mb = curr_bytes / (1024 * 1024)
-            total_mb = tot_bytes / (1024 * 1024) if tot_bytes > 0 else 1.0
-            pct = (curr_bytes / tot_bytes * 100) if tot_bytes > 0 else 0.0
-            speed = st.get('speed', 0.0)
-            bar = make_bar(pct, length=10)
-
-            if st.get('completed'):
-                status_str = "DONE"
-            else:
-                rem_bytes = max(0, tot_bytes - curr_bytes)
-                total_remaining_bytes += rem_bytes
-                total_speed_mb += speed
-                speed_bytes = speed * 1024 * 1024
-                eta_sec = (rem_bytes / speed_bytes) if speed_bytes > 0 else float('inf')
-                eta_str = self.format_time(eta_sec)
-                status_str = f"{speed:4.1f} MB/s | ETA: {eta_str}"
-            
-            short_name = fname if len(fname) <= 18 else fname[:8] + "..." + fname[-7:]
-            line = f"\x1b[K  ├─ {short_name:<18} [{bar}] {pct:5.1f}% | {curr_mb:4.0f}/{total_mb:4.0f}MB | {status_str}"
-            lines.append(line[:85])
-
-        if total_speed_mb > 0 and total_remaining_bytes > 0:
-            tot_speed_bytes = total_speed_mb * 1024 * 1024
-            total_eta_sec = total_remaining_bytes / tot_speed_bytes
-            tot_eta_str = self.format_time(total_eta_sec)
-            lines.append(f"\x1b[K  └─ Overall Speed: {total_speed_mb:4.1f} MB/s | Total Time Remaining: {tot_eta_str}".rstrip()[:85])
 
         out = "\n".join(lines) + "\n"
         sys.stdout.write(out)
@@ -212,15 +208,6 @@ class ParallelProgressManager:
 
     def stop(self):
         self.running = False
-
-async def download_part_task(client, msg, target_path, semaphore, manager):
-    fname = os.path.basename(target_path)
-    async with semaphore:
-        def cb(current, total):
-            manager.update(fname, current, total)
-            
-        await fast_download_media(client, msg, target_path, progress_callback=cb, parallel_connections=6)
-        manager.finish(fname)
 
 def extract_nested_archives(folder_path):
     """
@@ -253,242 +240,215 @@ def extract_nested_archives(folder_path):
             if archive_found:
                 break
 
-def extract_multipart_zip(zip_folder, subject_name):
-    """Extracts split multi-part zips (.001, .002...) cleanly with 7z and handles nested zips."""
-    target_extract_dir = os.path.join(EXTRACT_DIR, subject_name)
-    os.makedirs(target_extract_dir, exist_ok=True)
+def extract_multipart_zip_if_needed(file_path_or_dir, extract_to):
+    """
+    Handles zip files (single or split multi-part .001, .zip).
+    If it's a zip/multipart zip, extracts it to extract_to and deletes the original zip(s).
+    If it's a normal file (PDF, MP4, etc.), moves it to extract_to directly.
+    """
+    os.makedirs(extract_to, exist_ok=True)
+    if os.path.isdir(file_path_or_dir):
+        # Folder containing download parts
+        parts = sorted([os.path.join(file_path_or_dir, f) for f in os.listdir(file_path_or_dir) if not f.endswith(".tmp")])
+        if not parts:
+            return
+        
+        # Check if files inside are zip / archive parts
+        first_file = parts[0]
+        ext = os.path.splitext(first_file)[1].lower()
+        if ext in ['.zip', '.001', '.7z', '.rar', '.z01']:
+            log(f"Extracting multipart archive in '{file_path_or_dir}' to '{extract_to}'...")
+            cmd = ["7z", "x", first_file, f"-o{extract_to}", "-y"]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode == 0:
+                log(f"Successfully extracted multipart archive!")
+                shutil.rmtree(file_path_or_dir, ignore_errors=True)
+                extract_nested_archives(extract_to)
+            else:
+                log(f"Extraction failed: {res.stderr}")
+        else:
+            # Not a zip archive, move all regular files to extract_to
+            for p in parts:
+                dest = os.path.join(extract_to, os.path.basename(p))
+                shutil.move(p, dest)
+            shutil.rmtree(file_path_or_dir, ignore_errors=True)
+    else:
+        # Single file
+        ext = os.path.splitext(file_path_or_dir)[1].lower()
+        if ext in ['.zip', '.7z', '.rar']:
+            log(f"Extracting single archive '{file_path_or_dir}' to '{extract_to}'...")
+            cmd = ["7z", "x", file_path_or_dir, f"-o{extract_to}", "-y"]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode == 0:
+                log(f"Successfully extracted '{file_path_or_dir}'!")
+                os.remove(file_path_or_dir)
+                extract_nested_archives(extract_to)
+            else:
+                log(f"Failed extracting '{file_path_or_dir}': {res.stderr}")
+                dest = os.path.join(extract_to, os.path.basename(file_path_or_dir))
+                shutil.move(file_path_or_dir, dest)
+        else:
+            dest = os.path.join(extract_to, os.path.basename(file_path_or_dir))
+            shutil.move(file_path_or_dir, dest)
+
+async def upload_folder_gdrive(local_folder, remote_target_path, status_tracker=None):
+    """Uploads local_folder to GDrive using rclone with 5 parallel transfers."""
+    log(f"Uploading '{local_folder}' to GDrive path '{remote_target_path}'...")
     
-    parts = sorted([os.path.join(zip_folder, f) for f in os.listdir(zip_folder) if not f.endswith(".tmp")])
-    if not parts:
-        raise FileNotFoundError(f"No zip parts found in {zip_folder}")
-
-    first_part = parts[0]
-    for p in parts:
-        if p.endswith(".001") or p.endswith(".zip"):
-            first_part = p
-            break
-
-    log(f"Extracting multi-part archive starting from '{os.path.basename(first_part)}'...")
-
-    cmd = ["7z", "x", first_part, f"-o{target_extract_dir}", "-y"]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    if res.returncode != 0:
-        log(f"7z Extraction error:\n{res.stderr}")
-        raise RuntimeError(f"Extraction failed for {subject_name}")
-
-    log(f"Successfully extracted split volumes for '{subject_name}'!")
-    
-    # Delete original multi-part zips immediately to free disk space!
-    try:
-        if os.path.exists(zip_folder):
-            shutil.rmtree(zip_folder)
-            log(f"Deleted downloaded multi-part zips in '{zip_folder}' to free disk space!")
-    except Exception as e:
-        log(f"Warning: Could not remove multi-part zip folder: {e}")
-
-    # Extract any nested zips found inside the extracted folder
-    extract_nested_archives(target_extract_dir)
-
-def upload_to_gdrive_parallel(local_folder, subject_name):
-    remote_target = f"{RCLONE_REMOTE}/{subject_name}"
-    log(f"Uploading '{subject_name}' to GDrive ({remote_target}) with {RCLONE_TRANSFERS} parallel workers...")
-
     cmd = [
         "rclone", "copy",
         local_folder,
-        remote_target,
-        "--transfers", RCLONE_TRANSFERS,
+        remote_target_path,
+        "--transfers", str(RCLONE_TRANSFERS),
         "--checkers", "10",
         "--fast-list",
-        "--stats", "10s",
+        "--stats", "5s",
         "-P"
     ]
+    
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
 
-    res = subprocess.run(cmd)
-    if res.returncode != 0:
-        raise RuntimeError(f"Rclone upload failed for {subject_name}")
-    log(f"Upload completed for {subject_name}!")
+    fname = os.path.basename(local_folder)
+    if status_tracker:
+        status_tracker.update_upload(fname, 0, 100, status="Uploading...")
 
-def process_pending_extractions(state):
-    """Checks /tmp/tg_pipeline/extracted/ for unuploaded folders, extracts nested zips, and uploads them."""
-    if not os.path.exists(EXTRACT_DIR):
+    stdout, stderr = await proc.communicate()
+    
+    if proc.returncode != 0:
+        log(f"Rclone upload error:\n{stderr.decode()}")
+        raise RuntimeError(f"Rclone upload failed for {local_folder}")
+    
+    if status_tracker:
+        status_tracker.finish_upload(fname)
+    log(f"Upload complete for '{local_folder}'!")
+
+async def process_channel(client, channel_info, state, status_tracker):
+    channel_id = channel_info["channel_id"]
+    remote_folder = channel_info["remote_folder"]
+    channel_name = channel_info["name"]
+    chan_key = str(channel_id)
+
+    log("="*60)
+    log(f"STARTING CHANNEL: {channel_name} (ID: {channel_id}) -> GDrive: {RCLONE_REMOTE}/{remote_folder}")
+    log("="*60)
+
+    if chan_key not in state["downloaded_msg_ids"]:
+        state["downloaded_msg_ids"][chan_key] = []
+    if chan_key not in state["uploaded_files"]:
+        state["uploaded_files"][chan_key] = []
+
+    entity = None
+    try:
+        entity = await client.get_entity(channel_id)
+    except Exception:
+        async for dialog in client.iter_dialogs():
+            if str(dialog.id) == chan_key or str(dialog.id) == chan_key.replace('-100', '-'):
+                entity = dialog.entity
+                break
+
+    if not entity:
+        log(f"ERROR: Could not find Telegram entity for channel {channel_id}")
         return
 
-    extracted_folders = [d for d in os.listdir(EXTRACT_DIR) if os.path.isdir(os.path.join(EXTRACT_DIR, d))]
-    if not extracted_folders:
-        return
+    # Fetch messages with document media
+    messages_to_process = []
+    async for message in client.iter_messages(entity):
+        if message.media and isinstance(message.media, MessageMediaDocument):
+            if message.file and message.file.name:
+                if message.id not in state["downloaded_msg_ids"][chan_key]:
+                    messages_to_process.append(message)
 
-    log(f"Found {len(extracted_folders)} pending extracted folder(s) in /tmp: {extracted_folders}")
-    for subject in extracted_folders:
-        if subject in state["completed_subjects"]:
-            log(f"Skipping already completed subject '{subject}'.")
-            continue
+    messages_to_process.reverse() # Process oldest to newest
+    log(f"Found {len(messages_to_process)} pending media messages in channel '{channel_name}'.")
 
-        log(f"\nProcessing pending extracted folder: {subject}")
-        subj_extract_dir = os.path.join(EXTRACT_DIR, subject)
+    dl_semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+    
+    chan_dl_dir = os.path.join(DOWNLOAD_DIR, chan_key)
+    chan_ext_dir = os.path.join(EXTRACT_DIR, chan_key)
+    os.makedirs(chan_dl_dir, exist_ok=True)
+    os.makedirs(chan_ext_dir, exist_ok=True)
 
-        try:
-            # 1. Extract any inner nested zips
-            extract_nested_archives(subj_extract_dir)
+    for msg in messages_to_process:
+        fname = msg.file.name
+        target_path = os.path.join(chan_dl_dir, fname)
 
-            # 2. Upload to Google Drive
-            upload_to_gdrive_parallel(subj_extract_dir, subject)
+        # Check storage space on /tmp before downloading
+        _, _, free_bytes = shutil.disk_usage(TEMP_STORAGE_DIR)
+        if free_bytes < MIN_FREE_DISK_BYTES:
+            log(f"DISK SPACE LOW ({free_bytes / (1024**3):.2f} GB free). Uploading and clearing disk queue first...")
+            # Extract & upload whatever is currently in extract / download dir
+            extract_multipart_zip_if_needed(chan_dl_dir, chan_ext_dir)
+            remote_target = f"{RCLONE_REMOTE}/{remote_folder}"
+            await upload_folder_gdrive(chan_ext_dir, remote_target, status_tracker)
+            shutil.rmtree(chan_ext_dir, ignore_errors=True)
+            os.makedirs(chan_ext_dir, exist_ok=True)
+            log("Disk space freed after upload! Resuming downloads...")
 
-            # 3. Clean up folder
-            shutil.rmtree(subj_extract_dir)
+        async with dl_semaphore:
+            def dl_cb(current, total):
+                status_tracker.update_download(fname, current, total)
 
-            # 4. Save state
-            state["completed_subjects"].append(subject)
+            log(f"Downloading message {msg.id}: {fname}...")
+            # Standard Telethon download (No speed-hacking multi-connection)
+            await msg.download_media(file=target_path, progress_callback=dl_cb)
+            status_tracker.finish_download(fname)
+            
+            # Track state
+            state["downloaded_msg_ids"][chan_key].append(msg.id)
             save_state(state)
-            log(f"[SUCCESS] Pending subject '{subject}' extracted further, uploaded, and cleaned!")
-        except Exception as e:
-            log(f"[ERROR] Processing pending folder '{subject}' failed: {e}")
+
+        # After each download, extract zip / prepare for upload
+        extract_multipart_zip_if_needed(target_path, chan_ext_dir)
+
+    # Final upload of remaining extracted files for this channel
+    if os.path.exists(chan_ext_dir) and os.listdir(chan_ext_dir):
+        remote_target = f"{RCLONE_REMOTE}/{remote_folder}"
+        await upload_folder_gdrive(chan_ext_dir, remote_target, status_tracker)
+        shutil.rmtree(chan_ext_dir, ignore_errors=True)
+
+    if chan_key not in state["completed_channels"]:
+        state["completed_channels"].append(chan_key)
+        save_state(state)
+
+    log(f"FINISHED CHANNEL: {channel_name}!")
 
 async def main():
     cleanup_stale_session_locks()
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
-    os.makedirs(ZIP_DIR, exist_ok=True)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(EXTRACT_DIR, exist_ok=True)
 
     state = load_state()
     log("="*60)
-    log(f"GitHub Codespaces Pipeline (Priority Processing & Nested Zip Extraction)")
-    log(f"Completed subjects so far: {state['completed_subjects']}")
+    log("Starting General Telegram to Google Drive Pipeline")
+    log(f"Completed Channels: {state['completed_channels']}")
     log("="*60)
-
-    # First, process any pending extracted folders sitting in /tmp
-    process_pending_extractions(state)
 
     client = TelegramClient('telegram_session', API_ID, API_HASH)
 
     try:
         await client.start()
     except sqlite3.OperationalError as e:
-        log(f"SQLite lock error detected: {e}")
-        log("Attempting session recovery...")
+        log(f"SQLite lock error: {e}. Recovering...")
         cleanup_stale_session_locks()
         await asyncio.sleep(1)
         await client.start()
 
-    log("Fetching Telegram channel message list...")
-    entity = None
+    status_tracker = StatusTracker()
+    render_task = asyncio.create_task(status_tracker.render_loop())
+
     try:
-        entity = await client.get_entity(CHANNEL_ID)
-    except Exception:
-        async for dialog in client.iter_dialogs():
-            if str(dialog.id) == str(CHANNEL_ID) or str(dialog.id) == str(CHANNEL_ID).replace('-100', '-'):
-                entity = dialog.entity
-                break
-
-    if not entity:
-        log("ERROR: Could not locate Telegram channel!")
+        for channel_info in CHANNELS:
+            await process_channel(client, channel_info, state, status_tracker)
+    finally:
+        status_tracker.stop()
+        await render_task
         await client.disconnect()
-        return
-
-    subject_messages = defaultdict(list)
-    excluded_messages = defaultdict(list)
-
-    async for message in client.iter_messages(entity):
-        if message.media and isinstance(message.media, MessageMediaDocument):
-            if message.file and message.file.name:
-                fname = message.file.name
-                subject = parse_subject_name(fname)
-                
-                if any(ex.lower() in subject.lower() for ex in EXCLUDED_SUBJECTS):
-                    excluded_messages[subject].append((fname, message))
-                else:
-                    subject_messages[subject].append((fname, message))
-
-    sorted_subjects = sorted(subject_messages.keys(), key=get_subject_priority)
-    sorted_excluded = sorted(excluded_messages.keys())
-
-    log(f"Discovered Telegram channel subjects:")
-    log(f"  [TO BE DOWNLOADED / PROCESSED] ({len(sorted_subjects)} subjects):")
-    for idx, subj in enumerate(sorted_subjects, 1):
-        log(f"     {idx}. {subj}: {len(subject_messages[subj])} file parts")
-    log(f"  [SKIPPED / EXCLUDED] ({len(sorted_excluded)} subjects):")
-    for idx, subj in enumerate(sorted_excluded, 1):
-        log(f"     {idx}. {subj}: {len(excluded_messages[subj])} file parts")
-
-    semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
-
-    for subject in sorted_subjects:
-        msgs = subject_messages[subject]
-        
-        if subject in state["completed_subjects"]:
-            log(f"\n[SKIP] Subject '{subject}' already completed.")
-            continue
-
-        log(f"\n" + "="*50)
-        log(f"PROCESSING SUBJECT: {subject} ({len(msgs)} file parts)")
-        log("="*50)
-
-        msgs.sort(key=lambda x: x[0])
-
-        subj_zip_dir = os.path.join(ZIP_DIR, subject)
-        subj_extract_dir = os.path.join(EXTRACT_DIR, subject)
-
-        legacy_zip_dir = subj_zip_dir + ".zip"
-        if os.path.exists(legacy_zip_dir):
-            os.makedirs(subj_zip_dir, exist_ok=True)
-            for f in os.listdir(legacy_zip_dir):
-                shutil.move(os.path.join(legacy_zip_dir, f), os.path.join(subj_zip_dir, f))
-            shutil.rmtree(legacy_zip_dir)
-            log(f"Merged legacy folder '{legacy_zip_dir}' into '{subj_zip_dir}'")
-
-        os.makedirs(subj_zip_dir, exist_ok=True)
-
-        files_to_download = []
-        for fname, msg in msgs:
-            expected_size = msg.media.document.size if (msg.media and hasattr(msg.media, 'document')) else None
-            existing = find_existing_file(subj_zip_dir, fname, expected_size=expected_size)
-            if existing:
-                size_mb = os.path.getsize(existing) / (1024 * 1024)
-                log(f" [SKIP FILE] Found completed part '{os.path.basename(existing)}' ({size_mb:.1f} MB) on disk.")
-            else:
-                target_path = os.path.join(subj_zip_dir, fname)
-                files_to_download.append((fname, msg, target_path))
-
-        try:
-            if not files_to_download:
-                log(f"[ALL FILES PRESENT] All {len(msgs)} zip parts for '{subject}' are present on disk! Proceeding straight to extraction...")
-            else:
-                log(f"Downloading {len(files_to_download)} remaining parts in parallel...")
-                manager = ParallelProgressManager()
-                render_task = asyncio.create_task(manager.render_loop())
-
-                download_tasks = []
-                for fname, msg, target_path in files_to_download:
-                    download_tasks.append(download_part_task(client, msg, target_path, semaphore, manager))
-
-                await asyncio.gather(*download_tasks)
-                manager.stop()
-                await render_task
-                print("\nDownload complete for all remaining parts!")
-
-            # 2. Extract multi-part zips (.001, .002...) and any inner nested zips
-            extract_multipart_zip(subj_zip_dir, subject)
-
-            # 3. Upload extracted files in 5 parallel transfers to Google Drive via rclone
-            upload_to_gdrive_parallel(subj_extract_dir, subject)
-
-            # 5. Delete extracted files from /tmp
-            log(f"Cleaning extracted files for '{subject}'...")
-            shutil.rmtree(subj_extract_dir)
-
-            # 6. Save persistent state
-            state["completed_subjects"].append(subject)
-            save_state(state)
-            log(f"[SUCCESS] '{subject}' completed, uploaded to GDrive, and space cleaned!")
-
-        except Exception as e:
-            log(f"[ERROR] Subject '{subject}' failed: {e}")
-            state["failed_subjects"].append(subject)
-            save_state(state)
-
-    log("\nAll priority subjects successfully processed!")
-    await client.disconnect()
+        log("Pipeline execution finished cleanly.")
 
 if __name__ == '__main__':
     asyncio.run(main())

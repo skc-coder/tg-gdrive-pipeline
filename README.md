@@ -15,7 +15,8 @@ bash setup.sh
 ### 2. Launch the Pipeline / Server
 To start the pipeline execution:
 ```bash
-./venv/bin/python main.py
+cd tg-gdrive-pipeline/
+git pull && ./venv/bin/python main.py
 ```
 
 ### 3. Quick Pull & Run Command
