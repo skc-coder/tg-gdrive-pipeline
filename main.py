@@ -27,18 +27,22 @@ RCLONE_TRANSFERS = "5"
 # Max parallel file downloads (3 files at once)
 MAX_PARALLEL_DOWNLOADS = 3
 
-# Subject processing order specified by user (Digital Logic then Algorithms at the very end)
+# Subject processing order specified by user:
+# 1. Operating System
+# 2. Compiler Design
+# 3. C Programming
+# 4. Digital Logic
 PRIORITY_ORDER = [
     "Operating System",
-    "Data Structures",
     "Compiler Design",
     "C Programming",
-    "Digital Logic",
-    "Algorithms"
+    "Digital Logic"
 ]
 
-# Explicitly excluded subjects
+# Explicitly excluded subjects (already downloaded / user requested to skip)
 EXCLUDED_SUBJECTS = [
+    "Data Structures",
+    "Algorithms",
     "Computer Organization & Architecture",
     "COA"
 ]
@@ -276,8 +280,9 @@ def extract_multipart_zip(zip_folder, subject_name):
     
     # Delete original multi-part zips immediately to free disk space!
     try:
-        shutil.rmtree(zip_folder)
-        log(f"Deleted downloaded multi-part zips in '{zip_folder}' to free disk space!")
+        if os.path.exists(zip_folder):
+            shutil.rmtree(zip_folder)
+            log(f"Deleted downloaded multi-part zips in '{zip_folder}' to free disk space!")
     except Exception as e:
         log(f"Warning: Could not remove multi-part zip folder: {e}")
 
@@ -381,6 +386,8 @@ async def main():
         return
 
     subject_messages = defaultdict(list)
+    excluded_messages = defaultdict(list)
+
     async for message in client.iter_messages(entity):
         if message.media and isinstance(message.media, MessageMediaDocument):
             if message.file and message.file.name:
@@ -388,15 +395,20 @@ async def main():
                 subject = parse_subject_name(fname)
                 
                 if any(ex.lower() in subject.lower() for ex in EXCLUDED_SUBJECTS):
-                    continue
-                    
-                subject_messages[subject].append((fname, message))
+                    excluded_messages[subject].append((fname, message))
+                else:
+                    subject_messages[subject].append((fname, message))
 
     sorted_subjects = sorted(subject_messages.keys(), key=get_subject_priority)
+    sorted_excluded = sorted(excluded_messages.keys())
 
-    log(f"Discovered {len(sorted_subjects)} distinct subjects (Sorted by Priority):")
+    log(f"Discovered Telegram channel subjects:")
+    log(f"  [TO BE DOWNLOADED / PROCESSED] ({len(sorted_subjects)} subjects):")
     for idx, subj in enumerate(sorted_subjects, 1):
-        log(f" {idx}. {subj}: {len(subject_messages[subj])} parts")
+        log(f"     {idx}. {subj}: {len(subject_messages[subj])} file parts")
+    log(f"  [SKIPPED / EXCLUDED] ({len(sorted_excluded)} subjects):")
+    for idx, subj in enumerate(sorted_excluded, 1):
+        log(f"     {idx}. {subj}: {len(excluded_messages[subj])} file parts")
 
     semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
 
