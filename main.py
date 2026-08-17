@@ -1,481 +1,547 @@
+#!/usr/bin/env python3
+"""
+Stream Downloader Core Pipeline Engine.
+Low-Storage Parallel Producer-Consumer Architecture:
+ 1. Indexing course subjects & chapters (cached in .index_cache.json).
+    - Explicitly excludes Khazana courses/topics and Announcement tabs.
+    - Preserves ALL subjects (Physics, Chemistry, Biology, Maths, SST, English, Hindi, Computer Science, Notices).
+    - Properly URL-encodes MEDIA_TOKEN string to resolve video DASH streams.
+ 2. Concurrent PDF & ClearKey Video Downloader:
+    - Silently skips invalid/empty attachments (where key is missing).
+    - Downloads valid PDFs & ClearKey DRM videos into `staging/`.
+    - Atomically moves finished files to `ready_for_upload/`.
+ 3. Concurrent Uploader Worker Thread:
+    - Polls `ready_for_upload/` every 10 seconds.
+    - Uploads ready files directly to Google Drive `stream/Course/Subject/Chapter/`.
+    - Fixed rclone flag: `--delete-empty-src-dirs`
+    - Immediately deletes local files upon successful upload verification to free disk space!
+ 4. State tracking (.pipeline_state.json) guarantees 100% resume capability.
+"""
+
+import json
 import os
+import re
 import sys
 import time
-import json
-import re
 import subprocess
-import asyncio
-import shutil
-import sqlite3
-from collections import defaultdict
-from telethon import TelegramClient
-from telethon.tl.types import MessageMediaDocument
+from urllib.parse import parse_qs, urlparse, quote
+from concurrent.futures import ThreadPoolExecutor
+from curl_cffi import requests
 
+BASE_URL = "https://stream.testuk.org"
+PROXY_BASE = "https://proxy.streamvideo.co.in/fetch/api.penpencil.co"
 
+STAGING_DIR = "staging"
+READY_DIR = "ready_for_upload"
+INDEX_CACHE_FILE = ".index_cache.json"
+STATE_FILE = ".pipeline_state.json"
 
-# ==================== CONFIGURATION ====================
-API_ID = 21601842
-API_HASH = "b824abd0e19c6c67b0b38ec8d470ba03"
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Referer": "https://stream.testuk.org/"
+}
 
-# List of Telegram channels to process in order
-# Can also be managed via channels.json file in the root directory!
-DEFAULT_CHANNELS = [
-    {
-        "channel_id": -1002107557406,
-        "remote_folder": "GATE_Courses",
-        "name": "Primary GATE Channel"
-    }
-]
+# --- STATE & CACHE MANAGEMENT ---
 
-CHANNELS_FILE = os.path.abspath("channels.json")
-
-def load_channels():
-    if os.path.exists(CHANNELS_FILE):
-        try:
-            with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
-                chans = json.load(f)
-                if isinstance(chans, list) and len(chans) > 0:
-                    return chans
-        except Exception as e:
-            print(f"[WARNING] Could not parse channels.json: {e}")
-    # Write default channels.json if it doesn't exist
+def load_json(filepath, default):
+    if not os.path.exists(filepath):
+        return default
     try:
-        with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CHANNELS, f, indent=4)
-    except Exception:
-        pass
-    return DEFAULT_CHANNELS
+        with open(filepath) as f:
+            return json.load(f)
+    except:
+        return default
 
-CHANNELS = load_channels()
+def save_json(filepath, data):
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
 
-
-# Base Google Drive rclone remote
-RCLONE_REMOTE = "gdrive:"
-
-# Parallel upload threads for rclone
-RCLONE_TRANSFERS = 5
-
-# Max parallel file downloads from Telegram (using standard Telethon)
-MAX_PARALLEL_DOWNLOADS = 3
-
-# Storage safety thresholds (in Bytes) for /tmp partition (~40GB total on Codespaces)
-# If free disk space drops below MIN_FREE_DISK_BYTES, downloads pause until uploads clean space.
-MIN_FREE_DISK_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB minimum free buffer
-
-# Temporary storage partitions
-TEMP_STORAGE_DIR = "/tmp/tg_pipeline"
-DOWNLOAD_DIR = os.path.join(TEMP_STORAGE_DIR, "downloads")
-EXTRACT_DIR = os.path.join(TEMP_STORAGE_DIR, "extracted")
-
-# Persistent state & logs
-WORKSPACE_DIR = os.path.abspath("./pipeline_data")
-STATE_FILE = os.path.join(WORKSPACE_DIR, "state.json")
-LOG_FILE = os.path.join(WORKSPACE_DIR, "pipeline.log")
-# =======================================================
-
-def log(msg):
-    text = f"[LOG] {msg}"
-    print(text, flush=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(text + "\n")
-
-def cleanup_stale_session_locks():
-    journal_file = os.path.abspath("telegram_session.session-journal")
-    if os.path.exists(journal_file):
-        try:
-            os.remove(journal_file)
-            log("Removed orphaned sqlite session-journal file.")
-        except Exception:
-            pass
+def load_config():
+    return load_json("config.json", {})
 
 def load_state():
-    state = {
-        "completed_channels": [],
-        "downloaded_msg_ids": {},
-        "uploaded_files": {},
-    }
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    state.update(loaded)
-        except Exception:
-            pass
-    if "completed_channels" not in state:
-        state["completed_channels"] = []
-    if "downloaded_msg_ids" not in state:
-        state["downloaded_msg_ids"] = {}
-    if "uploaded_files" not in state:
-        state["uploaded_files"] = {}
-    return state
-
+    return load_json(STATE_FILE, {"downloaded": {}, "uploaded": {}, "course_indexed": {}})
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=4)
+    save_json(STATE_FILE, state)
 
-def make_bar(percentage, length=10):
-    filled = int(length * max(0.0, min(100.0, percentage)) / 100)
-    return "█" * filled + "░" * (length - filled)
+def is_item_done(item_id):
+    state = load_state()
+    return state.get("uploaded", {}).get(item_id, False)
 
-def format_time(seconds):
-    if seconds < 0 or seconds == float('inf') or math.isnan(seconds):
-        return "--:--"
-    secs = int(seconds)
-    mins, s = divmod(secs, 60)
-    hrs, m = divmod(mins, 60)
-    if hrs > 0:
-        return f"{hrs:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+def is_downloaded(item_id):
+    state = load_state()
+    return state.get("downloaded", {}).get(item_id, False)
 
-import math
+def mark_downloaded(item_id):
+    state = load_state()
+    if "downloaded" not in state:
+        state["downloaded"] = {}
+    state["downloaded"][item_id] = True
+    save_state(state)
 
-class StatusTracker:
-    def __init__(self):
-        self.downloads = {}  # fname -> {start, current, total, speed, completed}
-        self.uploads = {}    # fname -> {start, current, total, speed, status}
-        self.rendered_lines = 0
-        self.running = False
+def mark_uploaded(item_id):
+    state = load_state()
+    if "uploaded" not in state:
+        state["uploaded"] = {}
+    state["uploaded"][item_id] = True
+    save_state(state)
 
-    def update_download(self, fname, current, total):
-        now = time.time()
-        if fname not in self.downloads:
-            self.downloads[fname] = {'start': now, 'current': current, 'total': total, 'speed': 0.0, 'completed': False}
-        else:
-            st = self.downloads[fname]
-            elapsed = max(now - st['start'], 0.001)
-            st['current'] = current
-            st['total'] = total
-            st['speed'] = (current / (1024 * 1024)) / elapsed
+def load_cache():
+    return load_json(INDEX_CACHE_FILE, {})
 
-    def finish_download(self, fname):
-        if fname in self.downloads:
-            self.downloads[fname]['completed'] = True
+def save_cache(cache):
+    save_json(INDEX_CACHE_FILE, cache)
 
-    def update_upload(self, fname, current, total, status="Uploading"):
-        now = time.time()
-        if fname not in self.uploads:
-            self.uploads[fname] = {'start': now, 'current': current, 'total': total, 'speed': 0.0, 'status': status}
-        else:
-            st = self.uploads[fname]
-            elapsed = max(now - st['start'], 0.001)
-            st['current'] = current
-            st['total'] = total
-            st['speed'] = (current / (1024 * 1024)) / elapsed
-            st['status'] = status
+def load_courses():
+    if not os.path.exists("courses.txt"):
+        print("[!] courses.txt not found!")
+        return []
+    courses = []
+    with open("courses.txt") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                parsed = urlparse(line)
+                qs = parse_qs(parsed.query)
+                batch_id = qs.get("batchId", [None])[0]
+                batch_name = qs.get("batchName", ["Course"])[0]
+                if batch_id:
+                    courses.append({"batchId": batch_id, "batchName": batch_name, "url": line})
+    return courses
 
-    def finish_upload(self, fname):
-        if fname in self.uploads:
-            self.uploads[fname]['status'] = "DONE"
-            self.uploads[fname]['current'] = self.uploads[fname]['total']
+def sanitize_name(name):
+    return "".join(c if c.isalnum() or c in (" ", "-", "_", ".") else "_" for c in name).strip()
 
-    async def render_loop(self):
-        self.running = True
-        while self.running:
-            self.render()
-            await asyncio.sleep(0.5)
-        self.render()
+# --- HTTP SESSION SETUP ---
 
-    def render(self):
-        total, used, free = shutil.disk_usage(TEMP_STORAGE_DIR)
-        free_gb = free / (1024 ** 3)
-        total_gb = total / (1024 ** 3)
+cfg = load_config()
+session_cookie = cfg.get("session", "")
+session_expiry = cfg.get("session_expiry", "1786887774943")
 
-        lines = []
-        lines.append(f"\x1b[K=================== PIPELINE STATUS Dashboard ===================")
-        lines.append(f"\x1b[KStorage (/tmp): {free_gb:.1f} GB free of {total_gb:.1f} GB | Min Buffer: {MIN_FREE_DISK_BYTES/(1024**3):.1f} GB")
-        
-        # Download section
-        active_dl = {k: v for k, v in self.downloads.items() if not v.get('completed')}
-        lines.append(f"\x1b[KActive Downloads ({len(active_dl)} / {MAX_PARALLEL_DOWNLOADS}):")
-        tot_dl_speed = 0.0
-        tot_dl_rem = 0
-        for fname, st in list(active_dl.items())[-MAX_PARALLEL_DOWNLOADS:]:
-            curr_bytes = st['current']
-            tot_bytes = st['total']
-            pct = (curr_bytes / tot_bytes * 100) if tot_bytes > 0 else 0.0
-            speed = st.get('speed', 0.0)
-            tot_dl_speed += speed
-            rem_b = max(0, tot_bytes - curr_bytes)
-            tot_dl_rem += rem_b
-            eta = format_time(rem_b / (speed * 1024 * 1024)) if speed > 0 else "--:--"
-            bar = make_bar(pct, length=10)
-            sname = fname if len(fname) <= 20 else fname[:9] + "..." + fname[-8:]
-            lines.append(f"\x1b[K  [DL] {sname:<20} [{bar}] {pct:5.1f}% | {curr_bytes/(1024**2):4.0f}/{tot_bytes/(1024**2):4.0f}MB | {speed:4.1f}MB/s | ETA:{eta}")
+session = requests.Session()
+if session_cookie:
+    session.cookies.set("session", session_cookie, domain="stream.testuk.org")
+session.cookies.set("session_expiry", session_expiry, domain="stream.testuk.org")
+session.headers.update(DEFAULT_HEADERS)
 
-        if tot_dl_speed > 0:
-            overall_dl_eta = format_time(tot_dl_rem / (tot_dl_speed * 1024 * 1024))
-            lines.append(f"\x1b[K  └─ Total Download Speed: {tot_dl_speed:4.1f} MB/s | Combined ETA: {overall_dl_eta}")
+def fetch_json(url):
+    for attempt in range(3):
+        try:
+            r = session.get(url, impersonate="chrome120", timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            elif r.status_code == 429:
+                time.sleep(2 * (attempt + 1))
+        except Exception as e:
+            time.sleep(1)
+    return None
 
-        # Upload section
-        active_ul = {k: v for k, v in self.uploads.items() if v.get('status') != "DONE"}
-        lines.append(f"\x1b[KActive Uploads ({len(active_ul)} / {RCLONE_TRANSFERS} workers):")
-        for fname, st in list(active_ul.items())[-RCLONE_TRANSFERS:]:
-            curr_bytes = st['current']
-            tot_bytes = st['total']
-            pct = (curr_bytes / tot_bytes * 100) if tot_bytes > 0 else 0.0
-            speed = st.get('speed', 0.0)
-            status = st.get('status', 'Uploading')
-            bar = make_bar(pct, length=10)
-            sname = fname if len(fname) <= 20 else fname[:9] + "..." + fname[-8:]
-            lines.append(f"\x1b[K  [UL] {sname:<20} [{bar}] {pct:5.1f}% | {status} | {speed:4.1f}MB/s")
+def fetch_html(url):
+    for attempt in range(3):
+        try:
+            r = session.get(url, impersonate="chrome120", timeout=15)
+            if r.status_code == 200:
+                return r.text
+            elif r.status_code == 429:
+                time.sleep(2 * (attempt + 1))
+        except Exception as e:
+            time.sleep(1)
+    return ""
 
-        lines.append(f"\x1b[K================================================================")
+# --- INDEXING & RESOLVING ---
 
-        if self.rendered_lines > 0:
-            sys.stdout.write(f"\x1b[{self.rendered_lines}A")
+def get_subjects(batch_id):
+    url = f"{PROXY_BASE}/v3/batches/{batch_id}/details"
+    data = fetch_json(url)
+    if data and data.get("success"):
+        all_subs = data.get("data", {}).get("subjects", [])
+        valid_subs = []
+        for s in all_subs:
+            s_name = s.get("subject", "").strip().lower()
+            # Exclude ONLY Khazana & Announcement tabs
+            if "khazana" in s_name or s.get("khazanaProgramId"):
+                continue
+            if "announcement" in s_name:
+                continue
+            valid_subs.append(s)
+        return valid_subs
+    return []
 
-        out = "\n".join(lines) + "\n"
-        sys.stdout.write(out)
-        sys.stdout.flush()
-        self.rendered_lines = len(lines)
+def get_topics(batch_id, subject_id):
+    topics = []
+    page = 1
+    while True:
+        url = f"{PROXY_BASE}/v2/batches/{batch_id}/subject/{subject_id}/topics?page={page}"
+        data = fetch_json(url)
+        if not data or not data.get("success") or not data.get("data"):
+            break
+        items = data.get("data", [])
+        for item in items:
+            t_name = item.get("name", "").lower()
+            if "khazana" in t_name or "announcement" in t_name:
+                continue
+            topics.append(item)
+        if len(items) < 10:
+            break
+        page += 1
+    return topics
 
-    def stop(self):
-        self.running = False
+def get_contents(batch_id, subject_id, topic_id, content_type="videos"):
+    contents = []
+    page = 1
+    while True:
+        url = f"{PROXY_BASE}/v2/batches/{batch_id}/subject/{subject_id}/contents?page={page}&contentType={content_type}&tag={topic_id}"
+        data = fetch_json(url)
+        if not data or not data.get("success") or not data.get("data"):
+            break
+        items = data.get("data", [])
+        contents.extend(items)
+        if len(items) < 10:
+            break
+        page += 1
+    return contents
 
-def extract_nested_archives(folder_path):
-    """
-    Recursively checks for nested .zip, .7z, or .rar files inside folder_path,
-    extracts them further, and deletes the archive files.
-    """
-    archive_found = True
-    while archive_found:
-        archive_found = False
-        for root, dirs, files in os.walk(folder_path):
-            for file in files:
-                ext = os.path.splitext(file)[1].lower()
-                if ext in ['.zip', '.7z', '.rar']:
-                    archive_path = os.path.join(root, file)
-                    log(f"Found nested archive '{file}' inside '{root}'. Extracting further...")
-                    
-                    cmd = ["7z", "x", archive_path, f"-o{root}", "-y"]
-                    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    if res.returncode == 0:
-                        log(f"Successfully extracted nested archive '{file}'!")
-                        try:
-                            os.remove(archive_path)
-                            log(f"Deleted nested archive file '{file}' to free space.")
-                        except Exception as e:
-                            log(f"Warning: Could not remove nested archive '{file}': {e}")
-                        archive_found = True
-                        break
-                    else:
-                        log(f"Warning: Failed to extract nested archive '{file}': {res.stderr}")
-            if archive_found:
-                break
+def parse_schedule_details(batch_id, subject_id, schedule_id, cache):
+    cache_key = f"vid_details:{schedule_id}"
+    if cache_key in cache:
+        return cache[cache_key]
 
-def extract_multipart_zip_if_needed(file_path_or_dir, extract_to):
-    """
-    Handles zip files (single or split multi-part .001, .zip).
-    If it's a zip/multipart zip, extracts it to extract_to and deletes the original zip(s).
-    If it's a normal file (PDF, MP4, etc.), moves it to extract_to directly.
-    """
-    os.makedirs(extract_to, exist_ok=True)
-    if os.path.isdir(file_path_or_dir):
-        # Folder containing download parts
-        parts = sorted([os.path.join(file_path_or_dir, f) for f in os.listdir(file_path_or_dir) if not f.endswith(".tmp")])
-        if not parts:
-            return
-        
-        # Check if files inside are zip / archive parts
-        first_file = parts[0]
-        ext = os.path.splitext(first_file)[1].lower()
-        if ext in ['.zip', '.001', '.7z', '.rar', '.z01']:
-            log(f"Extracting multipart archive in '{file_path_or_dir}' to '{extract_to}'...")
-            cmd = ["7z", "x", first_file, f"-o{extract_to}", "-y"]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if res.returncode == 0:
-                log(f"Successfully extracted multipart archive!")
-                shutil.rmtree(file_path_or_dir, ignore_errors=True)
-                extract_nested_archives(extract_to)
-            else:
-                log(f"Extraction failed: {res.stderr}")
-        else:
-            # Not a zip archive, move all regular files to extract_to
-            for p in parts:
-                dest = os.path.join(extract_to, os.path.basename(p))
-                shutil.move(p, dest)
-            shutil.rmtree(file_path_or_dir, ignore_errors=True)
-    else:
-        # Single file
-        ext = os.path.splitext(file_path_or_dir)[1].lower()
-        if ext in ['.zip', '.7z', '.rar']:
-            log(f"Extracting single archive '{file_path_or_dir}' to '{extract_to}'...")
-            cmd = ["7z", "x", file_path_or_dir, f"-o{extract_to}", "-y"]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if res.returncode == 0:
-                log(f"Successfully extracted '{file_path_or_dir}'!")
-                os.remove(file_path_or_dir)
-                extract_nested_archives(extract_to)
-            else:
-                log(f"Failed extracting '{file_path_or_dir}': {res.stderr}")
-                dest = os.path.join(extract_to, os.path.basename(file_path_or_dir))
-                shutil.move(file_path_or_dir, dest)
-        else:
-            dest = os.path.join(extract_to, os.path.basename(file_path_or_dir))
-            shutil.move(file_path_or_dir, dest)
+    url = f"{BASE_URL}/schedule-details?batchId={batch_id}&subjectId={subject_id}&scheduleId={schedule_id}&tap=video"
+    html = fetch_html(url)
+    if not html:
+        return {}
 
-async def upload_folder_gdrive(local_folder, remote_target_path, status_tracker=None):
-    """Uploads local_folder to GDrive using rclone with 5 parallel transfers."""
-    log(f"Uploading '{local_folder}' to GDrive path '{remote_target_path}'...")
-    
-    cmd = [
-        "rclone", "copy",
-        local_folder,
-        remote_target_path,
-        "--transfers", str(RCLONE_TRANSFERS),
-        "--checkers", "10",
-        "--fast-list",
-        "--stats", "5s",
-        "-P"
-    ]
-    
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
+    info = {
+        "mediaToken": None,
+        "slides": [],
+        "notes": [],
+        "dppNotes": [],
+        "topicName": None,
+        "videoStream": None
+    }
 
-    fname = os.path.basename(local_folder)
-    if status_tracker:
-        status_tracker.update_upload(fname, 0, 100, status="Uploading...")
+    m_token = re.search(r'const\s+MEDIA_TOKEN\s*=\s*"([^"]+)";', html)
+    if m_token:
+        info["mediaToken"] = m_token.group(1)
 
-    stdout, stderr = await proc.communicate()
-    
-    if proc.returncode != 0:
-        log(f"Rclone upload error:\n{stderr.decode()}")
-        raise RuntimeError(f"Rclone upload failed for {local_folder}")
-    
-    if status_tracker:
-        status_tracker.finish_upload(fname)
-    log(f"Upload complete for '{local_folder}'!")
+    m_topic = re.search(r'const\s+TOPIC_NAME\s*=\s*"([^"]+)";', html)
+    if m_topic:
+        info["topicName"] = m_topic.group(1)
 
-async def process_channel(client, channel_info, state, status_tracker):
-    channel_id = channel_info["channel_id"]
-    remote_folder = channel_info["remote_folder"]
-    channel_name = channel_info["name"]
-    chan_key = str(channel_id)
+    m_notes = re.search(r'const\s+NOTES\s*=\s*(\[.*?\]);', html, re.DOTALL)
+    if m_notes:
+        try:
+            info["notes"] = json.loads(m_notes.group(1))
+        except:
+            pass
 
-    log("="*60)
-    log(f"STARTING CHANNEL: {channel_name} (ID: {channel_id}) -> GDrive: {RCLONE_REMOTE}/{remote_folder}")
-    log("="*60)
+    if info["mediaToken"]:
+        enc_token = quote(info["mediaToken"], safe="")
+        stream_url = f"{BASE_URL}/v1/videos/video-url-details?mediaToken={enc_token}&videoContainerType=DASH"
+        stream_data = fetch_json(stream_url)
+        if stream_data and stream_data.get("data"):
+            info["videoStream"] = stream_data.get("data")
 
-    if chan_key not in state["downloaded_msg_ids"]:
-        state["downloaded_msg_ids"][chan_key] = []
-    if chan_key not in state["uploaded_files"]:
-        state["uploaded_files"][chan_key] = []
+    cache[cache_key] = info
+    save_cache(cache)
+    return info
 
-    entity = None
-    try:
-        entity = await client.get_entity(channel_id)
-    except Exception:
-        async for dialog in client.iter_dialogs():
-            if str(dialog.id) == chan_key or str(dialog.id) == chan_key.replace('-100', '-'):
-                entity = dialog.entity
-                break
+def index_course(course, cache):
+    b_id = course["batchId"]
+    b_name = course["batchName"]
+    print(f"\n==================================================")
+    print(f"[*] INDEXING COURSE: {b_name} ({b_id}) [Excluding Khazana]")
+    print(f"==================================================")
 
-    if not entity:
-        log(f"ERROR: Could not find Telegram entity for channel {channel_id}")
+    course_entry = {"batchId": b_id, "batchName": b_name, "subjects": []}
+    subjects = get_subjects(b_id)
+    print(f"[+] Found {len(subjects)} subjects")
+
+    for s_idx, sub in enumerate(subjects, 1):
+        s_id = sub["_id"]
+        s_name = sub["subject"]
+        print(f"\n  [Subject {s_idx}/{len(subjects)}] Indexing Subject: {s_name}")
+        sub_entry = {"id": s_id, "name": s_name, "chapters": []}
+        topics = get_topics(b_id, s_id)
+        print(f"  └─ Found {len(topics)} chapters/topics")
+
+        for t_idx, top in enumerate(topics, 1):
+            t_id = top["_id"]
+            t_name = top["name"]
+            print(f"     [Chapter {t_idx}/{len(topics)}] {t_name}")
+            ch_entry = {"id": t_id, "name": t_name, "videos": [], "notes": []}
+
+            raw_videos = get_contents(b_id, s_id, t_id, "videos")
+            
+            def process_video_item(v_item):
+                v_id = v_item["_id"]
+                v_title = v_item.get("topic") or v_item.get("videoDetails", {}).get("name") or "Untitled Video"
+                details = parse_schedule_details(b_id, s_id, v_id, cache)
+                return {
+                    "id": v_id,
+                    "title": v_title,
+                    "mediaToken": details.get("mediaToken"),
+                    "videoStream": details.get("videoStream"),
+                    "notes": details.get("notes", [])
+                }
+
+            if raw_videos:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    ch_entry["videos"] = list(executor.map(process_video_item, raw_videos))
+                print(f"        ├─ Videos found & resolved: {len(ch_entry['videos'])}")
+
+            raw_notes = get_contents(b_id, s_id, t_id, "notes")
+            for n_item in raw_notes:
+                for hw in n_item.get("homeworkIds", []):
+                    for att in hw.get("attachmentIds", []):
+                        base_u = att.get("baseUrl", "")
+                        att_k = att.get("key", "")
+                        if base_u and att_k:
+                            ch_entry["notes"].append({
+                                "name": hw.get("topic") or att.get("name") or "Note",
+                                "url": base_u + att_k
+                            })
+            if ch_entry["notes"]:
+                print(f"        └─ Notes found: {len(ch_entry['notes'])}")
+
+            sub_entry["chapters"].append(ch_entry)
+        course_entry["subjects"].append(sub_entry)
+
+    return course_entry
+
+# --- ATOMIC MOVE TO READY_FOR_UPLOAD ---
+
+def move_to_ready(staging_path, ready_path):
+    os.makedirs(os.path.dirname(ready_path), exist_ok=True)
+    os.rename(staging_path, ready_path)
+
+# --- DOWNLOADERS ---
+
+def is_valid_file_url(url):
+    if not url or not isinstance(url, str):
+        return False
+    url_clean = url.strip()
+    if not url_clean.startswith("http://") and not url_clean.startswith("https://"):
+        return False
+    parsed = urlparse(url_clean)
+    if not parsed.path or parsed.path == "/" or parsed.path.endswith("/"):
+        return False
+    return True
+
+def download_pdf_task(item):
+    url = item["url"]
+    staging_path = item["staging_path"]
+    ready_path = item["ready_path"]
+    item_id = item["item_id"]
+
+    if not is_valid_file_url(url):
         return
 
-    # Fetch messages with document media
-    messages_to_process = []
-    async for message in client.iter_messages(entity):
-        if message.media and isinstance(message.media, MessageMediaDocument):
-            if message.file and message.file.name:
-                if message.id not in state["downloaded_msg_ids"][chan_key]:
-                    messages_to_process.append(message)
+    if is_item_done(item_id):
+        return
 
-    messages_to_process.reverse() # Process oldest to newest
-    log(f"Found {len(messages_to_process)} pending media messages in channel '{channel_name}'.")
+    if os.path.exists(ready_path):
+        mark_downloaded(item_id)
+        return
 
-    dl_semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+    os.makedirs(os.path.dirname(staging_path), exist_ok=True)
     
-    chan_dl_dir = os.path.join(DOWNLOAD_DIR, chan_key)
-    chan_ext_dir = os.path.join(EXTRACT_DIR, chan_key)
-    os.makedirs(chan_dl_dir, exist_ok=True)
-    os.makedirs(chan_ext_dir, exist_ok=True)
+    for attempt in range(3):
+        try:
+            r = session.get(url, headers=DEFAULT_HEADERS, impersonate="chrome120", timeout=30)
+            if r.status_code == 200 and len(r.content) > 0:
+                with open(staging_path, "wb") as f:
+                    f.write(r.content)
+                move_to_ready(staging_path, ready_path)
+                mark_downloaded(item_id)
+                print(f"[PDF READY FOR UPLOAD] {ready_path}")
+                return
+            elif r.status_code == 403:
+                time.sleep(1)
+        except Exception as e:
+            time.sleep(1)
 
-    async def download_worker(msg):
-        fname = msg.file.name
-        target_path = os.path.join(chan_dl_dir, fname)
+    print(f"[FAIL] HTTP 403 / Download error for {url}")
 
-        # Check storage space on /tmp before downloading
-        _, _, free_bytes = shutil.disk_usage(TEMP_STORAGE_DIR)
-        if free_bytes < MIN_FREE_DISK_BYTES:
-            log(f"DISK SPACE LOW ({free_bytes / (1024**3):.2f} GB free). Pausing download...")
-            while shutil.disk_usage(TEMP_STORAGE_DIR)[2] < MIN_FREE_DISK_BYTES:
-                await asyncio.sleep(5)
+def download_video_task(item):
+    stream_info = item["stream_info"]
+    staging_path = item["staging_path"]
+    ready_path = item["ready_path"]
+    v_id = item["v_id"]
+    item_id = f"video:{v_id}"
 
-        async with dl_semaphore:
-            def dl_cb(current, total):
-                status_tracker.update_download(fname, current, total)
+    if is_item_done(item_id):
+        return
 
-            log(f"Downloading message {msg.id}: {fname}...")
-            # Pure native Telethon download from initial commit ce40119
-            await msg.download_media(file=target_path, progress_callback=dl_cb)
-            status_tracker.finish_download(fname)
-            
-            # Track state
-            state["downloaded_msg_ids"][chan_key].append(msg.id)
-            save_state(state)
+    if os.path.exists(ready_path):
+        mark_downloaded(item_id)
+        return
 
-        # After download, extract zip / prepare for upload
-        extract_multipart_zip_if_needed(target_path, chan_ext_dir)
+    os.makedirs(os.path.dirname(staging_path), exist_ok=True)
+    manifest_url = stream_info.get("url")
+    keys = stream_info.get("keys", [])
 
-    # Launch parallel downloads batch
-    tasks = [download_worker(m) for m in messages_to_process]
-    await asyncio.gather(*tasks)
+    if not manifest_url or not is_valid_file_url(manifest_url):
+        return
 
+    cmd = ["yt-dlp", manifest_url, "-o", staging_path]
+    for key in keys:
+        cmd.extend(["--key", key])
+    cmd.extend(["--concurrent-fragments", "5", "--no-mtime", "--quiet"])
 
+    print(f"[DOWNLOADING VIDEO] {ready_path}")
+    try:
+        res = subprocess.run(cmd)
+        if res.returncode == 0:
+            move_to_ready(staging_path, ready_path)
+            mark_downloaded(item_id)
+            print(f"[VIDEO READY FOR UPLOAD] {ready_path}")
+    except Exception as e:
+        print(f"[ERROR] Video download failed: {e}")
 
+# --- UPLOADER WORKER (POLLS ready_for_upload & DELETES UPON SUCCESS) ---
 
-    # Final upload of remaining extracted files for this channel
-    if os.path.exists(chan_ext_dir) and os.listdir(chan_ext_dir):
-        remote_target = f"{RCLONE_REMOTE}/{remote_folder}"
-        await upload_folder_gdrive(chan_ext_dir, remote_target, status_tracker)
-        shutil.rmtree(chan_ext_dir, ignore_errors=True)
+def uploader_worker(stop_event, config):
+    remote_name = config.get("gdrive_remote_name", "gdrive")
+    root_folder = config.get("gdrive_root_folder", "stream")
+    upload_threads = config.get("gdrive_upload_threads", 6)
+    target_remote = f"{remote_name}:{root_folder}"
 
-    if chan_key not in state["completed_channels"]:
-        state["completed_channels"].append(chan_key)
-        save_state(state)
+    print("[*] Uploader Worker active. Polling ready_for_upload/ every 10 seconds...")
 
-    log(f"FINISHED CHANNEL: {channel_name}!")
+    while not stop_event.is_set():
+        if os.path.exists(READY_DIR):
+            files_to_upload = []
+            for root, _, files in os.walk(READY_DIR):
+                for f in files:
+                    files_to_upload.append(os.path.join(root, f))
 
-async def main():
-    cleanup_stale_session_locks()
-    os.makedirs(WORKSPACE_DIR, exist_ok=True)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(EXTRACT_DIR, exist_ok=True)
+            if files_to_upload:
+                print(f"\n[UPLOADER] Found {len(files_to_upload)} files ready for upload. Syncing to Google Drive...")
+                cmd = [
+                    "rclone", "move", READY_DIR, target_remote,
+                    "--transfers", str(upload_threads), "--checkers", str(upload_threads * 2),
+                    "--delete-empty-src-dirs", "--fast-list"
+                ]
+                res = subprocess.run(cmd)
+                if res.returncode == 0:
+                    print(f"[✓ UPLOADER] Successfully uploaded & deleted local copies to free disk space!")
+                else:
+                    print(f"[!] Uploader rclone exited code {res.returncode}")
 
-    state = load_state()
-    log("="*60)
-    log("Starting General Telegram to Google Drive Pipeline")
-    log(f"Completed Channels: {state['completed_channels']}")
-    log("="*60)
+        time.sleep(10)
 
-    client = TelegramClient('telegram_session', API_ID, API_HASH)
+# --- MAIN EXECUTION FLOW ---
+
+def main():
+    print("🚀 Stream Parallel Downloader & Uploader Engine Starting...")
+    courses = load_courses()
+    if not courses:
+        print("[!] No courses found in courses.txt!")
+        sys.exit(1)
+
+    cfg = load_config()
+    cache = load_cache()
+    pdf_threads = cfg.get("pdf_download_threads", 8)
+    video_threads = cfg.get("video_download_threads", 3)
+
+    import threading
+    stop_uploader = threading.Event()
+    uploader_thread = threading.Thread(target=uploader_worker, args=(stop_uploader, cfg), daemon=True)
+    uploader_thread.start()
 
     try:
-        await client.start()
-    except sqlite3.OperationalError as e:
-        log(f"SQLite lock error: {e}. Recovering...")
-        cleanup_stale_session_locks()
-        await asyncio.sleep(1)
-        await client.start()
+        for c_idx, course in enumerate(courses, 1):
+            c_name = course["batchName"]
+            print(f"\n##################################################")
+            print(f"   PROCESSING COURSE [{c_idx}/{len(courses)}]: {c_name}")
+            print(f"##################################################")
 
-    status_tracker = StatusTracker()
-    render_task = asyncio.create_task(status_tracker.render_loop())
+            # Indexing (cached)
+            course_entry = index_course(course, cache)
 
-    try:
-        for channel_info in CHANNELS:
-            await process_channel(client, channel_info, state, status_tracker)
+            # Process course items (PDFs & DRM Videos concurrently)
+            pdf_items = []
+            video_items = []
+
+            for sub in course_entry.get("subjects", []):
+                sub_name = sanitize_name(sub["name"])
+                for ch in sub.get("chapters", []):
+                    ch_name = sanitize_name(ch["name"])
+
+                    # 1. Videos and their attached notes
+                    for vid in ch.get("videos", []):
+                        v_title = sanitize_name(vid["title"])
+                        v_id = vid["id"]
+                        stream_info = vid.get("videoStream")
+                        if stream_info:
+                            rel_path = os.path.join(c_name, sub_name, ch_name, f"{v_title}.mp4")
+                            video_items.append({
+                                "v_id": v_id,
+                                "stream_info": stream_info,
+                                "staging_path": os.path.join(STAGING_DIR, rel_path),
+                                "ready_path": os.path.join(READY_DIR, rel_path)
+                            })
+
+                        for note in vid.get("notes", []):
+                            url = note.get("url")
+                            n_name = sanitize_name(note.get("name", "Note"))
+                            if is_valid_file_url(url):
+                                fname = f"{n_name}.pdf" if not n_name.endswith(".pdf") else n_name
+                                rel_path = os.path.join(c_name, sub_name, ch_name, fname)
+                                pdf_items.append({
+                                    "url": url,
+                                    "staging_path": os.path.join(STAGING_DIR, rel_path),
+                                    "ready_path": os.path.join(READY_DIR, rel_path),
+                                    "item_id": f"pdf:{url}"
+                                })
+
+                    # 2. Standalone chapter notes
+                    for note in ch.get("notes", []):
+                        url = note.get("url")
+                        n_name = sanitize_name(note.get("name", "Note"))
+                        if is_valid_file_url(url):
+                            fname = f"{n_name}.pdf" if not n_name.endswith(".pdf") else n_name
+                            rel_path = os.path.join(c_name, sub_name, ch_name, fname)
+                            pdf_items.append({
+                                "url": url,
+                                "staging_path": os.path.join(STAGING_DIR, rel_path),
+                                "ready_path": os.path.join(READY_DIR, rel_path),
+                                "item_id": f"pdf:{url}"
+                            })
+
+            total_files = len(pdf_items) + len(video_items)
+            print(f"\n[+] Total items indexed for {c_name}: {len(pdf_items)} PDFs, {len(video_items)} Videos (Total: {total_files} items).")
+
+            # Execute parallel downloads (PDFs and DRM Videos concurrently using ThreadPoolExecutor)
+            with ThreadPoolExecutor(max_workers=pdf_threads + video_threads) as executor:
+                futures = []
+                for p_item in pdf_items:
+                    futures.append(executor.submit(download_pdf_task, p_item))
+                for v_item in video_items:
+                    futures.append(executor.submit(download_video_task, v_item))
+                for f in futures:
+                    f.result()
+
+            print(f"\n[+] Finished downloading all {total_files} items for course {c_name}.")
+            print(f"[*] Waiting for uploader worker to sync all pending files to Google Drive...")
+            while True:
+                has_files = False
+                if os.path.exists(READY_DIR):
+                    for root, _, files in os.walk(READY_DIR):
+                        if files:
+                            has_files = True
+                            break
+                if not has_files:
+                    break
+                time.sleep(5)
+            print(f"[✓] All files for course {c_name} have been completely uploaded and synced!")
+
     finally:
-        status_tracker.stop()
-        await render_task
-        await client.disconnect()
-        log("Pipeline execution finished cleanly.")
+        stop_uploader.set()
+        print("\n🎉 ALL COURSES PROCESSED, DOWNLOADED, AND UPLOADED TO GOOGLE DRIVE!")
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    main()

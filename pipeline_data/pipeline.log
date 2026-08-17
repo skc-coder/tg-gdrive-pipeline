@@ -1,0 +1,20 @@
+[LOG] ============================================================
+[LOG] GitHub Codespaces Pipeline (Priority Processing & Nested Zip Extraction)
+[LOG] Completed subjects so far: []
+[LOG] ============================================================
+[LOG] Fetching Telegram channel message list...
+[LOG] Discovered Telegram channel subjects:
+[LOG]   [TO BE DOWNLOADED / PROCESSED] (4 subjects):
+[LOG]      1. Operating System: 4 file parts
+[LOG]      2. Compiler Design: 2 file parts
+[LOG]      3. C Programming: 3 file parts
+[LOG]      4. Digital Logic: 7 file parts
+[LOG]   [SKIPPED / EXCLUDED] (3 subjects):
+[LOG]      1. Algorithms: 5 file parts
+[LOG]      2. Computer Organization & Architecture: 4 file parts
+[LOG]      3. Data Structures: 4 file parts
+[LOG] 
+==================================================
+[LOG] PROCESSING SUBJECT: Operating System (4 file parts)
+[LOG] ==================================================
+[LOG] Downloading 4 remaining parts in parallel...
